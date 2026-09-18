@@ -1,0 +1,395 @@
+//
+//  GeminiService.swift
+//  Grounded
+//
+//  Talks to Google's Generative Language API (Gemini). Three jobs:
+//    1. classify(taskTitle:)      -> what kind of proof fits this task
+//    2. verifyPhoto(task:imageData:) -> judge a photo proof
+//    3. verifyPDF(task:pdfData:)     -> judge a PDF proof (sent as extracted text)
+//
+//  Timer proofs never reach this file — they are judged locally in the view model.
+//
+//  MODEL NAME: Google rotates these. If a call 404s, `model` below is the first
+//  thing to change. Confirm the current name at https://aistudio.google.com.
+//
+
+import Foundation
+import UIKit
+
+/// Abstraction so previews can inject a canned implementation (see `FakeGeminiService`).
+protocol GeminiProviding: Sendable {
+    func classify(taskTitle: String) async throws -> ProofType
+    func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult
+    func verifyPDF(task: FocusTask, pdfData: Data) async throws -> VerificationResult
+}
+
+actor GeminiService: GeminiProviding {
+
+    // MARK: - Errors
+
+    enum GeminiError: LocalizedError {
+        /// The key in Secrets.swift is missing or still the placeholder.
+        case missingAPIKey
+        /// Could not reach the server at all (offline, DNS, timeout).
+        case network
+        /// Server replied with a non-2xx status.
+        case http(status: Int, body: String)
+        /// Server replied 2xx but the payload could not be understood.
+        case malformedResponse(detail: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .missingAPIKey:
+                return "No Gemini API key set. Open Grounded/Support/Secrets.swift and paste your key from aistudio.google.com."
+            case .network:
+                return "Couldn't reach Gemini. Check your internet connection and try again."
+            case .http(let status, let body):
+                switch status {
+                case 400, 401, 403:
+                    return "Gemini rejected the request (HTTP \(status)). Your API key is probably wrong, disabled, or missing. \(Self.hint(fromBody: body))"
+                case 404:
+                    return "Gemini returned 404 — the model name is probably out of date. Update `model` in GeminiService.swift (check aistudio.google.com)."
+                case 429:
+                    return "Gemini quota exceeded (HTTP 429). Wait a bit, or check usage/limits at aistudio.google.com."
+                case 500...599:
+                    return "Gemini had a server error (HTTP \(status)). Try again in a moment."
+                default:
+                    return "Gemini returned an unexpected error (HTTP \(status))."
+                }
+            case .malformedResponse(let detail):
+                return "Gemini's response couldn't be read (\(detail)). Try submitting again."
+            }
+        }
+
+        private static func hint(fromBody body: String) -> String {
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return "" }
+            let clipped = trimmed.count > 200 ? String(trimmed.prefix(200)) + "…" : trimmed
+            return "Server said: \(clipped)"
+        }
+    }
+
+    // MARK: - Config
+
+    /// If Google retires this, calls 404. This is the one line to change.
+    private let model = "gemini-2.0-flash"
+
+    private let apiKey: String
+    private let session: URLSession
+
+    init(apiKey: String = Secrets.geminiAPIKey) {
+        self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 60
+        config.waitsForConnectivity = false
+        self.session = URLSession(configuration: config)
+    }
+
+    private var hasUsableKey: Bool {
+        !apiKey.isEmpty && apiKey != "PASTE_YOUR_KEY_HERE"
+    }
+
+    private var endpoint: URL {
+        URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)")!
+    }
+
+    // MARK: - 1. Classify
+
+    func classify(taskTitle: String) async throws -> ProofType {
+        guard hasUsableKey else { throw GeminiError.missingAPIKey }
+
+        let prompt = """
+        You are Grounded's proof classifier. A user commits to a real task and \
+        then must submit evidence it is genuinely finished.
+
+        Task: "\(taskTitle)"
+
+        Choose the single best kind of proof:
+        - "photo": handwritten or physical work, a whiteboard, a built thing, a tidied space — anything best shown in a picture.
+        - "pdf": a digital document — essay, problem set, exported notes, report, code printout.
+        - "timer": effort with no tangible artifact — reading, practice, meditation, revision. Pick a sensible whole number of minutes from 10 to 120.
+
+        Respond with ONLY this JSON and nothing else:
+        {"proof_type": "photo" | "pdf" | "timer", "minutes": <integer or null>, "reason": "<short phrase>"}
+        """
+
+        let body = RequestBody(
+            contents: [.init(parts: [.init(text: prompt, inlineData: nil)])],
+            generationConfig: .init(responseMimeType: "application/json", temperature: 0.2)
+        )
+
+        // Per spec: fall back to a 25-minute timer if the RESPONSE can't be
+        // parsed. Transport / HTTP errors still propagate so the UI can explain them.
+        let text: String
+        do {
+            text = try await sendRequest(body)
+        } catch let error as GeminiError {
+            switch error {
+            case .malformedResponse:
+                return .timer(minutes: 25)
+            default:
+                throw error
+            }
+        }
+
+        guard let data = text.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(ClassifyPayload.self, from: data) else {
+            return .timer(minutes: 25)
+        }
+
+        switch decoded.proof_type.lowercased() {
+        case "photo":
+            return .photo
+        case "pdf":
+            return .pdf
+        case "timer":
+            let minutes = decoded.minutes ?? 25
+            return .timer(minutes: min(max(minutes, 5), 180))
+        default:
+            return .timer(minutes: 25)
+        }
+    }
+
+    // MARK: - 2. Verify photo
+
+    func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult {
+        guard hasUsableKey else { throw GeminiError.missingAPIKey }
+
+        guard let jpeg = Self.downscaledJPEG(from: imageData, maxEdge: 1024, quality: 0.7) else {
+            throw GeminiError.malformedResponse(detail: "the photo could not be read as an image")
+        }
+
+        let body = RequestBody(
+            contents: [.init(parts: [
+                .init(text: Self.verificationPrompt(for: task), inlineData: nil),
+                .init(text: nil, inlineData: .init(mimeType: "image/jpeg", data: jpeg.base64EncodedString()))
+            ])],
+            generationConfig: .init(responseMimeType: "application/json", temperature: 0.2)
+        )
+
+        return try await runVerification(body)
+    }
+
+    // MARK: - 3. Verify PDF
+
+    func verifyPDF(task: FocusTask, pdfData: Data) async throws -> VerificationResult {
+        guard hasUsableKey else { throw GeminiError.missingAPIKey }
+
+        let extracted = PDFTextExtractor.extractText(from: pdfData)
+        let trimmed = extracted.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Almost no text -> almost certainly a scanned PDF. Don't spend a call.
+        guard trimmed.count >= 25 else {
+            return VerificationResult(
+                passed: false,
+                confidence: 0,
+                feedback: "This PDF has no readable text, so it's probably a scan. Re-submit it as a photo instead."
+            )
+        }
+
+        let clipped = String(trimmed.prefix(6000))
+        let prompt = """
+        \(Self.verificationPrompt(for: task))
+
+        Below is the extracted text of the user's PDF (it may be truncated):
+        \"\"\"
+        \(clipped)
+        \"\"\"
+        """
+
+        let body = RequestBody(
+            contents: [.init(parts: [.init(text: prompt, inlineData: nil)])],
+            generationConfig: .init(responseMimeType: "application/json", temperature: 0.2)
+        )
+
+        return try await runVerification(body)
+    }
+
+    // MARK: - Shared verification plumbing
+
+    private func runVerification(_ body: RequestBody) async throws -> VerificationResult {
+        let text = try await sendRequest(body)
+
+        guard let data = text.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(VerifyPayload.self, from: data) else {
+            throw GeminiError.malformedResponse(detail: "verification JSON was not in the expected shape")
+        }
+
+        let confidence = Double(min(max(payload.confidence, 0), 100))
+        let passed = payload.verified && confidence >= VerificationResult.passThreshold
+
+        return VerificationResult(
+            passed: passed,
+            confidence: confidence,
+            feedback: payload.feedback.isEmpty ? "No feedback returned." : payload.feedback
+        )
+    }
+
+    private static func verificationPrompt(for task: FocusTask) -> String {
+        """
+        You are Grounded's proof grader. Be fair but skeptical: reward genuine,
+        specific evidence that the task below is actually finished, and reject
+        blank or near-blank pages, images or documents unrelated to the task,
+        screenshots of someone else's work or of web search results, generic
+        stock photos, and work that is only partly done.
+
+        Task: "\(task.title)"
+        Expected kind of proof: \(task.suggestedProof.displayName)
+
+        Your feedback must be one specific, actionable sentence — name what you
+        see and, if failing, what is missing.
+
+        Respond with ONLY this JSON and nothing else:
+        {"verified": <true|false>, "confidence": <integer 0-100>, "feedback": "<one sentence>"}
+        """
+    }
+
+    // MARK: - Networking
+
+    private func sendRequest(_ body: RequestBody) async throws -> String {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 60
+
+        do {
+            request.httpBody = try JSONEncoder().encode(body)
+        } catch {
+            throw GeminiError.malformedResponse(detail: "could not encode the request")
+        }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw GeminiError.network
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw GeminiError.malformedResponse(detail: "no HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw GeminiError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+        }
+
+        let apiResponse: GenerateContentResponse
+        do {
+            apiResponse = try JSONDecoder().decode(GenerateContentResponse.self, from: data)
+        } catch {
+            throw GeminiError.malformedResponse(detail: "top-level JSON did not decode")
+        }
+
+        if let blockReason = apiResponse.promptFeedback?.blockReason {
+            throw GeminiError.malformedResponse(detail: "the prompt was blocked (\(blockReason))")
+        }
+
+        guard let text = apiResponse.candidates?.first?.content?.parts?
+            .compactMap(\.text).joined(), !text.isEmpty else {
+            throw GeminiError.malformedResponse(detail: "no text in the first candidate")
+        }
+
+        return text
+    }
+
+    // MARK: - Image downscaling
+
+    private static func downscaledJPEG(from data: Data, maxEdge: CGFloat, quality: CGFloat) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+
+        let longEdge = max(image.size.width, image.size.height)
+        let scale = longEdge > maxEdge ? maxEdge / longEdge : 1
+        let targetSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let resized = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        return resized.jpegData(compressionQuality: quality)
+    }
+}
+
+// MARK: - Wire types (request)
+
+private struct RequestBody: Encodable {
+    struct Content: Encodable {
+        struct Part: Encodable {
+            let text: String?
+            let inlineData: InlineData?
+        }
+        struct InlineData: Encodable {
+            let mimeType: String
+            let data: String
+        }
+        let parts: [Part]
+    }
+    struct GenerationConfig: Encodable {
+        let responseMimeType: String
+        let temperature: Double
+    }
+    let contents: [Content]
+    let generationConfig: GenerationConfig
+}
+
+// MARK: - Wire types (response)
+
+private struct GenerateContentResponse: Decodable {
+    struct Candidate: Decodable {
+        struct Content: Decodable {
+            struct Part: Decodable { let text: String? }
+            let parts: [Part]?
+        }
+        let content: Content?
+    }
+    struct PromptFeedback: Decodable { let blockReason: String? }
+    let candidates: [Candidate]?
+    let promptFeedback: PromptFeedback?
+}
+
+// MARK: - Strict-JSON contracts returned *inside* the model's text
+
+private struct ClassifyPayload: Decodable {
+    let proof_type: String
+    let minutes: Int?
+    let reason: String?
+}
+
+private struct VerifyPayload: Decodable {
+    let verified: Bool
+    let confidence: Int
+    let feedback: String
+}
+
+// MARK: - Preview / test double
+
+#if DEBUG
+/// Returns canned results with no network. Used by SwiftUI previews.
+struct FakeGeminiService: GeminiProviding {
+    var classifyResult: ProofType = .photo
+    var verifyResult: VerificationResult = .init(
+        passed: true,
+        confidence: 92,
+        feedback: "The photo clearly shows all ten matrix problems worked through by hand."
+    )
+    /// When set, every call throws this instead of returning.
+    var error: GeminiService.GeminiError?
+
+    func classify(taskTitle: String) async throws -> ProofType {
+        if let error { throw error }
+        return classifyResult
+    }
+    func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult {
+        if let error { throw error }
+        return verifyResult
+    }
+    func verifyPDF(task: FocusTask, pdfData: Data) async throws -> VerificationResult {
+        if let error { throw error }
+        return verifyResult
+    }
+}
+#endif
