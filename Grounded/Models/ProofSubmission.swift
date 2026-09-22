@@ -14,8 +14,7 @@ struct ProofSubmission: Identifiable, Codable, Equatable {
     let taskID: UUID
     let type: ProofType
     let submittedAt: Date
-    /// File name (not a full path) under Documents/proofs. `nil` for timer proofs,
-    /// which have no file.
+    /// File name (not a full path) under Documents/proofs.
     var fileName: String?
     /// The judgement, once it comes back. `nil` while verifying.
     var result: VerificationResult?

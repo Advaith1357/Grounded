@@ -3,10 +3,12 @@
 //  Grounded
 //
 //  Entry point. Creates the single view model (with the real GeminiService,
-//  the real TaskStore and the MockAppBlocker) and hands it to ContentView.
+//  the real TaskStore, and the MockShieldManager) and hands it to RootTabView,
+//  the 4-tab shell.
 //
-//  To plug in real blocking later: build a `ScreenTimeBlocker: AppBlocker` and
-//  pass it here instead of `MockAppBlocker()`. Nothing else changes.
+//  To plug in real screen-time enforcement later: build a
+//  `ScreenTimeShieldManager: ShieldManager` and pass it here instead of
+//  `MockShieldManager()`. Nothing else changes.
 //
 
 import SwiftUI
@@ -17,7 +19,7 @@ struct GroundedApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(viewModel: viewModel)
+            RootTabView(viewModel: viewModel)
         }
     }
 }

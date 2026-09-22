@@ -2,12 +2,14 @@
 //  GeminiService.swift
 //  Grounded
 //
-//  Talks to Google's Generative Language API (Gemini). Three jobs:
-//    1. classify(taskTitle:)      -> what kind of proof fits this task
-//    2. verifyPhoto(task:imageData:) -> judge a photo proof
-//    3. verifyPDF(task:pdfData:)     -> judge a PDF proof (sent as extracted text)
+//  Talks to Google's Generative Language API (Gemini). Two jobs:
+//    1. verifyPhoto(task:imageData:) -> judge a photo proof
+//    2. verifyPDF(task:pdfData:)     -> judge a PDF proof (sent as extracted text)
 //
-//  Timer proofs never reach this file — they are judged locally in the view model.
+//  There's no classify step anymore — the app no longer asks Gemini what kind
+//  of proof a task needs. The user always has both Photo and PDF available for
+//  the active task, and states what they intend to submit ("Proposed proof")
+//  themselves at creation time; that text is passed along as grading context.
 //
 //  MODEL NAME: Google rotates these. If a call 404s, `model` below is the first
 //  thing to change. Confirm the current name at https://aistudio.google.com.
@@ -16,9 +18,8 @@
 import Foundation
 import UIKit
 
-/// Abstraction so previews can inject a canned implementation (see `FakeGeminiService`).
+/// Abstraction so previews (and "Mock AI Mode" in Settings) can skip the network.
 protocol GeminiProviding: Sendable {
-    func classify(taskTitle: String) async throws -> ProofType
     func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult
     func verifyPDF(task: FocusTask, pdfData: Data) async throws -> VerificationResult
 }
@@ -28,7 +29,7 @@ actor GeminiService: GeminiProviding {
     // MARK: - Errors
 
     enum GeminiError: LocalizedError {
-        /// The key in Secrets.swift is missing or still the placeholder.
+        /// No key in the Keychain and Secrets.swift is still the placeholder.
         case missingAPIKey
         /// Could not reach the server at all (offline, DNS, timeout).
         case network
@@ -40,7 +41,7 @@ actor GeminiService: GeminiProviding {
         var errorDescription: String? {
             switch self {
             case .missingAPIKey:
-                return "No Gemini API key set. Open Grounded/Support/Secrets.swift and paste your key from aistudio.google.com."
+                return "No Gemini API key set. Add one in Settings (The Kernel), or paste it into Secrets.swift for local dev."
             case .network:
                 return "Couldn't reach Gemini. Check your internet connection and try again."
             case .http(let status, let body):
@@ -48,7 +49,7 @@ actor GeminiService: GeminiProviding {
                 case 400, 401, 403:
                     return "Gemini rejected the request (HTTP \(status)). Your API key is probably wrong, disabled, or missing. \(Self.hint(fromBody: body))"
                 case 404:
-                    return "Gemini returned 404 — the model name is probably out of date. Update `model` in GeminiService.swift (check aistudio.google.com)."
+                    return "Gemini returned 404 — the model name is probably out of date. Update `model` in GeminiService.swift (check aistudio.google.com). \(Self.hint(fromBody: body))"
                 case 429:
                     return "Gemini quota exceeded (HTTP 429). Wait a bit, or check usage/limits at aistudio.google.com."
                 case 500...599:
@@ -72,12 +73,15 @@ actor GeminiService: GeminiProviding {
     // MARK: - Config
 
     /// If Google retires this, calls 404. This is the one line to change.
-    private let model = "gemini-2.0-flash"
+    private let model = "gemini-3.6-flash"
 
     private let apiKey: String
     private let session: URLSession
 
-    init(apiKey: String = Secrets.geminiAPIKey) {
+    /// Prefers the Keychain-stored key (set via the Kernel settings sheet);
+    /// falls back to the compiled `Secrets.geminiAPIKey` placeholder so the
+    /// existing local-dev setup keeps working until a key is pasted in Settings.
+    init(apiKey: String = KeychainStore.loadGeminiAPIKey() ?? Secrets.geminiAPIKey) {
         self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let config = URLSessionConfiguration.default
@@ -95,64 +99,7 @@ actor GeminiService: GeminiProviding {
         URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)")!
     }
 
-    // MARK: - 1. Classify
-
-    func classify(taskTitle: String) async throws -> ProofType {
-        guard hasUsableKey else { throw GeminiError.missingAPIKey }
-
-        let prompt = """
-        You are Grounded's proof classifier. A user commits to a real task and \
-        then must submit evidence it is genuinely finished.
-
-        Task: "\(taskTitle)"
-
-        Choose the single best kind of proof:
-        - "photo": handwritten or physical work, a whiteboard, a built thing, a tidied space — anything best shown in a picture.
-        - "pdf": a digital document — essay, problem set, exported notes, report, code printout.
-        - "timer": effort with no tangible artifact — reading, practice, meditation, revision. Pick a sensible whole number of minutes from 10 to 120.
-
-        Respond with ONLY this JSON and nothing else:
-        {"proof_type": "photo" | "pdf" | "timer", "minutes": <integer or null>, "reason": "<short phrase>"}
-        """
-
-        let body = RequestBody(
-            contents: [.init(parts: [.init(text: prompt, inlineData: nil)])],
-            generationConfig: .init(responseMimeType: "application/json", temperature: 0.2)
-        )
-
-        // Per spec: fall back to a 25-minute timer if the RESPONSE can't be
-        // parsed. Transport / HTTP errors still propagate so the UI can explain them.
-        let text: String
-        do {
-            text = try await sendRequest(body)
-        } catch let error as GeminiError {
-            switch error {
-            case .malformedResponse:
-                return .timer(minutes: 25)
-            default:
-                throw error
-            }
-        }
-
-        guard let data = text.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode(ClassifyPayload.self, from: data) else {
-            return .timer(minutes: 25)
-        }
-
-        switch decoded.proof_type.lowercased() {
-        case "photo":
-            return .photo
-        case "pdf":
-            return .pdf
-        case "timer":
-            let minutes = decoded.minutes ?? 25
-            return .timer(minutes: min(max(minutes, 5), 180))
-        default:
-            return .timer(minutes: 25)
-        }
-    }
-
-    // MARK: - 2. Verify photo
+    // MARK: - Verify photo
 
     func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult {
         guard hasUsableKey else { throw GeminiError.missingAPIKey }
@@ -172,7 +119,7 @@ actor GeminiService: GeminiProviding {
         return try await runVerification(body)
     }
 
-    // MARK: - 3. Verify PDF
+    // MARK: - Verify PDF
 
     func verifyPDF(task: FocusTask, pdfData: Data) async throws -> VerificationResult {
         guard hasUsableKey else { throw GeminiError.missingAPIKey }
@@ -228,15 +175,18 @@ actor GeminiService: GeminiProviding {
     }
 
     private static func verificationPrompt(for task: FocusTask) -> String {
-        """
+        let proposedProofLine = task.proposedProof.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? ""
+            : "\nThe user said their proof would be: \"\(task.proposedProof)\""
+
+        return """
         You are Grounded's proof grader. Be fair but skeptical: reward genuine,
         specific evidence that the task below is actually finished, and reject
         blank or near-blank pages, images or documents unrelated to the task,
         screenshots of someone else's work or of web search results, generic
         stock photos, and work that is only partly done.
 
-        Task: "\(task.title)"
-        Expected kind of proof: \(task.suggestedProof.displayName)
+        Task: "\(task.title)"\(proposedProofLine)
 
         Your feedback must be one specific, actionable sentence — name what you
         see and, if failing, what is missing.
@@ -351,13 +301,7 @@ private struct GenerateContentResponse: Decodable {
     let promptFeedback: PromptFeedback?
 }
 
-// MARK: - Strict-JSON contracts returned *inside* the model's text
-
-private struct ClassifyPayload: Decodable {
-    let proof_type: String
-    let minutes: Int?
-    let reason: String?
-}
+// MARK: - Strict-JSON contract returned *inside* the model's text
 
 private struct VerifyPayload: Decodable {
     let verified: Bool
@@ -365,24 +309,20 @@ private struct VerifyPayload: Decodable {
     let feedback: String
 }
 
-// MARK: - Preview / test double
+// MARK: - Mock provider (SwiftUI previews AND "Mock AI Mode" in Settings)
 
-#if DEBUG
-/// Returns canned results with no network. Used by SwiftUI previews.
+/// Returns a canned result with no network call. Not `#if DEBUG`-gated: this
+/// is a real, user-facing feature (the Settings toggle), not just a preview
+/// helper, so it must exist in every build configuration.
 struct FakeGeminiService: GeminiProviding {
-    var classifyResult: ProofType = .photo
     var verifyResult: VerificationResult = .init(
         passed: true,
         confidence: 92,
-        feedback: "The photo clearly shows all ten matrix problems worked through by hand."
+        feedback: "Mock AI Mode: automatically approved without a network call."
     )
     /// When set, every call throws this instead of returning.
     var error: GeminiService.GeminiError?
 
-    func classify(taskTitle: String) async throws -> ProofType {
-        if let error { throw error }
-        return classifyResult
-    }
     func verifyPhoto(task: FocusTask, imageData: Data) async throws -> VerificationResult {
         if let error { throw error }
         return verifyResult
@@ -392,4 +332,3 @@ struct FakeGeminiService: GeminiProviding {
         return verifyResult
     }
 }
-#endif

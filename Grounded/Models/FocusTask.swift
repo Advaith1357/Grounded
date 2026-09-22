@@ -2,16 +2,19 @@
 //  FocusTask.swift
 //  Grounded
 //
-//  A single thing the user commits to doing. Named `FocusTask`, NOT `Task`,
-//  because `Task` collides with Swift Concurrency's `Task` type.
+//  A single item in the user-generated task queue. Named `FocusTask`, NOT
+//  `Task`, because `Task` collides with Swift Concurrency's `Task` type.
+//
+//  No `suggestedProof` field anymore: there's no AI classification step at
+//  creation time. `proposedProof` is the user's own free-text description of
+//  what they intend to submit ("Proposed proof" at creation) — it's passed to
+//  Gemini as context when they actually submit a photo or PDF later.
 //
 
 import Foundation
 
-/// Lifecycle of a task. Replaces a bare `isComplete` bool so an abandoned task
-/// is distinguishable from a verified one in history.
 enum TaskStatus: String, Codable {
-    case active
+    case queued
     case completed
     case abandoned
 }
@@ -19,31 +22,24 @@ enum TaskStatus: String, Codable {
 struct FocusTask: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String
-    var suggestedProof: ProofType
+    var proposedProof: String
     var createdAt: Date
-    /// Set when the task leaves the `.active` state (completed or abandoned).
     var completedAt: Date?
     var status: TaskStatus
-    var starsEarned: Int
 
     init(
         id: UUID = UUID(),
         title: String,
-        suggestedProof: ProofType,
+        proposedProof: String,
         createdAt: Date = Date(),
         completedAt: Date? = nil,
-        status: TaskStatus = .active,
-        starsEarned: Int = 0
+        status: TaskStatus = .queued
     ) {
         self.id = id
         self.title = title
-        self.suggestedProof = suggestedProof
+        self.proposedProof = proposedProof
         self.createdAt = createdAt
         self.completedAt = completedAt
         self.status = status
-        self.starsEarned = starsEarned
     }
-
-    /// Convenience for call sites that only care whether the task was verified.
-    var isComplete: Bool { status == .completed }
 }
