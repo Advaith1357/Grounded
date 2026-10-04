@@ -40,6 +40,9 @@ final class GroundedViewModel: ObservableObject {
     @Published private(set) var shieldState: ShieldState = .grounded
     /// Seconds left in the current Discharge break; 0 while grounded.
     @Published private(set) var unlockRemaining: TimeInterval = 0
+    /// True during the nightly Circuit Breaker window: the shield is forced on
+    /// and Discharge is unavailable.
+    @Published private(set) var nightlyLockoutActive = false
     @Published private(set) var isVerifying = false
     /// The most recent verification outcome, shown as a dismissible banner in Queue.
     @Published var lastResult: VerificationResult?
@@ -61,7 +64,7 @@ final class GroundedViewModel: ObservableObject {
     init(
         store: TaskStore = TaskStore(),
         gemini: GeminiProviding = GeminiService(),
-        shield: ShieldManager = MockShieldManager()
+        shield: ShieldManager
     ) {
         self.store = store
         self.gemini = gemini
@@ -70,13 +73,17 @@ final class GroundedViewModel: ObservableObject {
         rebuildFromStore()
 
         // Resume an in-progress Discharge break across launches, or clear a
-        // stale one that expired while the app was closed.
-        if let endsAt = economy.unlockEndsAt, endsAt > Date() {
+        // stale one that expired — or was cut short by the Circuit Breaker —
+        // while the app was closed.
+        nightlyLockoutActive = NightlyLockout.current.isActive()
+        if let endsAt = economy.unlockEndsAt, endsAt > Date(), !nightlyLockoutActive {
             shield.unlock()
             shieldState = .unlocked
+            shield.scheduleReGround(at: endsAt)
         } else {
-            if economy.unlockEndsAt != nil {
+            if let endsAt = economy.unlockEndsAt {
                 var e = economy
+                e.voltageBalance += Self.refundMinutes(until: endsAt)
                 e.unlockEndsAt = nil
                 store.setEconomy(e)
                 economy = e
@@ -86,7 +93,7 @@ final class GroundedViewModel: ObservableObject {
         }
 
         tick()
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
     }
@@ -208,14 +215,16 @@ final class GroundedViewModel: ObservableObject {
     /// Spend Voltage for a timed break. 1V = 1 minute, so `amount` is both the
     /// cost and the break length in minutes.
     func discharge(amount: Int) {
-        guard shieldState == .grounded, economy.voltageBalance >= amount else { return }
+        guard shieldState == .grounded, !nightlyLockoutActive, economy.voltageBalance >= amount else { return }
+        let endsAt = Date().addingTimeInterval(TimeInterval(amount * 60))
         var e = economy
         e.voltageBalance -= amount
-        e.unlockEndsAt = Date().addingTimeInterval(TimeInterval(amount * 60))
+        e.unlockEndsAt = endsAt
         store.setEconomy(e)
         economy = e
 
         shield.unlock()
+        shield.scheduleReGround(at: endsAt)
         shieldState = .unlocked
         updateUnlockRemaining()
     }
@@ -227,23 +236,38 @@ final class GroundedViewModel: ObservableObject {
     func reGround() {
         var e = economy
         if let endsAt = e.unlockEndsAt {
-            let unusedMinutes = Int(max(0, endsAt.timeIntervalSinceNow) / 60)
-            e.voltageBalance += unusedMinutes
+            e.voltageBalance += Self.refundMinutes(until: endsAt)
         }
         e.unlockEndsAt = nil
         store.setEconomy(e)
         economy = e
 
+        shield.cancelScheduledReGround()
         shield.ground()
         shieldState = .grounded
         unlockRemaining = 0
+    }
+
+    /// Whole minutes left until `endsAt`, rounded to the nearest minute;
+    /// 0 once it has passed.
+    private static func refundMinutes(until endsAt: Date) -> Int {
+        Int((max(0, endsAt.timeIntervalSinceNow) / 60).rounded())
     }
 
     // MARK: - Trickle charge (passive generator while the queue is empty)
 
     private func tick() {
         catchUpTrickle()
+        updateNightlyLockout()
         updateUnlockRemaining()
+    }
+
+    /// Circuit Breaker: when the nightly window opens mid-break, the break is
+    /// cut short (unused minutes are refunded by `reGround`).
+    private func updateNightlyLockout() {
+        let active = NightlyLockout.current.isActive()
+        if active != nightlyLockoutActive { nightlyLockoutActive = active }
+        if active, shieldState == .unlocked { reGround() }
     }
 
     private func catchUpTrickle() {
@@ -324,15 +348,38 @@ final class GroundedViewModel: ObservableObject {
 enum SettingsKey {
     static let mockAIMode = "settings.mockAIMode"
     static let nightlyLockoutTime = "settings.nightlyLockoutTime"
+    static let nightlyWakeTime = "settings.nightlyWakeTime"
+    static let friendsServerURL = "settings.friendsServerURL"
+    static let defaultFriendsServerURL = "http://127.0.0.1:8787"
 
     /// 10:00 PM today, encoded as `timeIntervalSinceReferenceDate` (only the
     /// time-of-day portion is ever read back out via `.hourAndMinute`/`.shortened`).
     static var defaultLockoutInterval: Double {
+        interval(hour: NightlyLockout.defaultStart.hour, minute: NightlyLockout.defaultStart.minute)
+    }
+
+    /// 6:00 AM today, same encoding.
+    static var defaultWakeInterval: Double {
+        interval(hour: NightlyLockout.defaultWake.hour, minute: NightlyLockout.defaultWake.minute)
+    }
+
+    private static func interval(hour: Int, minute: Int) -> Double {
         let calendar = Calendar.current
         var components = calendar.dateComponents([.year, .month, .day], from: Date())
-        components.hour = 22
-        components.minute = 0
+        components.hour = hour
+        components.minute = minute
         return calendar.date(from: components)?.timeIntervalSinceReferenceDate ?? 0
+    }
+}
+
+extension NightlyLockout {
+    /// The lockout configured in the Kernel sheet (default 10:00 PM - 6:00 AM).
+    static var current: NightlyLockout {
+        let defaults = UserDefaults.standard
+        return NightlyLockout(
+            lockoutTimeInterval: defaults.object(forKey: SettingsKey.nightlyLockoutTime) as? Double ?? SettingsKey.defaultLockoutInterval,
+            wakeTimeInterval: defaults.object(forKey: SettingsKey.nightlyWakeTime) as? Double ?? SettingsKey.defaultWakeInterval
+        )
     }
 }
 

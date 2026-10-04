@@ -1,0 +1,4 @@
+// Committed. Anything personal goes in Local.xcconfig (gitignored).
+// The leading "?" makes the include optional, so a fresh clone still builds
+// for the simulator without it.
+#include? "Local.xcconfig"

@@ -2,18 +2,23 @@
 //  CircuitNode.swift
 //  Grounded
 //
-//  Home's central visual — a denser, more organic PCB fan-out than the
-//  original 8-spoke version: traces attach at many points around the ring
-//  (not just the 8 cardinal/diagonal axes) but each still travels in a single
+//  Home's central visual — a static yellow "Capacitor" ring with a dense PCB
+//  fan-out radiating from it. Traces attach at many points around the ring
+//  (not just 8 cardinal/diagonal axes) but each still travels in a single
 //  hard 45°-multiple compass direction once it leaves the ring, the way a
-//  real chip's fan-out routing snaps onto the grid. Round vias at the tips
-//  instead of square pads, occasional T-branch taps for density, and a
-//  faint radial fill so the ring reads as a chip rather than a bare outline.
+//  real chip's fan-out routing snaps onto the grid. Round vias at the tips,
+//  occasional T-branch taps for density, and a faint radial fill so the ring
+//  reads as a chip rather than a bare outline.
 //
-//  `isCharging` drives a traveling brightness pulse along every trace: when
-//  grounded (charging), the pulse travels from each trace's outer tip back
-//  toward the ring; when unlocked (discharging), it travels from the ring
-//  out to the tip.
+//  `isCharging` drives a dashed-stroke flow animation on every trace: the
+//  dash pattern's phase is swept continuously so the dashes visibly travel
+//  along each trace. When grounded (charging), they travel from the outer
+//  tip back toward the ring (Voltage flowing in); when unlocked
+//  (discharging), they travel from the ring out to the tip. Traces are built
+//  start-at-ring / end-at-tip, and increasing `dashPhase` slides the visible
+//  dashes toward the path's start (SwiftUI's dashPhase follows the same
+//  convention as SVG's stroke-dashoffset) — so charging sweeps the phase
+//  forward and discharging sweeps it backward.
 //
 
 import SwiftUI
@@ -24,7 +29,8 @@ struct CircuitNode: View {
     var isCharging: Bool = true
 
     private let padSize: CGFloat = 5
-    private let pulsePeriod: Double = 2.4
+    private let dashPattern: [CGFloat] = [10, 10]
+    private let dashSpeed: CGFloat = 26 // points per second
     private let traceCount = 16
     private let runLengths: [CGFloat] = [34, 20, 42, 26, 16, 38, 22, 46]
 
@@ -56,7 +62,7 @@ struct CircuitNode: View {
                 let center = CGPoint(x: size.width / 2, y: size.height / 2)
                 let radius = diameter / 2
                 let time = timeline.date.timeIntervalSinceReferenceDate
-                let travel = travelPosition(at: time)
+                let phase = dashPhase(at: time)
                 let ring = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
 
                 context.fill(
@@ -68,9 +74,11 @@ struct CircuitNode: View {
                 )
 
                 for spec in traces {
-                    drawTrace(in: &context, center: center, radius: radius, spec: spec, travel: travel)
+                    drawTrace(in: &context, center: center, radius: radius, spec: spec, phase: phase)
                 }
 
+                // The Capacitor itself: a large, static yellow circle — no
+                // dash animation applied here, only to the traces.
                 context.stroke(Path(ellipseIn: ring), with: .color(color), lineWidth: 2)
             }
         }
@@ -81,29 +89,12 @@ struct CircuitNode: View {
         .shadow(color: color.opacity(0.25), radius: 12)
     }
 
-    /// 0 = pulse sitting at the ring (inner end), 1 = pulse sitting at the
-    /// outermost tip. Charging sweeps 1 -> 0 (energy flowing inward);
-    /// discharging sweeps 0 -> 1 (energy flowing outward).
-    private func travelPosition(at time: Double) -> Double {
-        let phase = (time.truncatingRemainder(dividingBy: pulsePeriod)) / pulsePeriod
-        return isCharging ? (1 - phase) : phase
-    }
-
-    private func bump(at t: Double, travel: Double) -> Double {
-        let sigma = 0.22
-        let amplitude = 0.55
-        let delta = t - travel
-        return amplitude * exp(-(delta * delta) / (2 * sigma * sigma))
-    }
-
-    private func pulseGradient(baseOpacity: Double, travel: Double) -> Gradient {
-        let stopCount = 8
-        let stops = (0...stopCount).map { i -> Gradient.Stop in
-            let t = Double(i) / Double(stopCount)
-            let opacity = min(1.0, baseOpacity + bump(at: t, travel: travel))
-            return Gradient.Stop(color: color.opacity(opacity), location: t)
-        }
-        return Gradient(stops: stops)
+    /// Sweeps continuously forward while grounded (dashes slide toward the
+    /// ring / path start = inward) and backward while unlocked (dashes slide
+    /// toward the tip / path end = outward).
+    private func dashPhase(at time: Double) -> CGFloat {
+        let direction: CGFloat = isCharging ? 1 : -1
+        return CGFloat(time) * dashSpeed * direction
     }
 
     /// A trace leaves the ring at `attachDegrees` (any of the 16 evenly
@@ -111,7 +102,7 @@ struct CircuitNode: View {
     /// `routeDegrees` — the nearest 45°-multiple compass direction — ending
     /// in a round via. About a third of traces get a short perpendicular
     /// branch tap partway along for extra density.
-    private func drawTrace(in context: inout GraphicsContext, center: CGPoint, radius: CGFloat, spec: TraceSpec, travel: Double) {
+    private func drawTrace(in context: inout GraphicsContext, center: CGPoint, radius: CGFloat, spec: TraceSpec, phase: CGFloat) {
         let attachRad = Angle(degrees: spec.attachDegrees).radians
         let adx = cos(attachRad)
         let ady = sin(attachRad)
@@ -125,23 +116,25 @@ struct CircuitNode: View {
         var main = Path()
         main.move(to: start)
         main.addLine(to: end)
-        context.stroke(main, with: .linearGradient(pulseGradient(baseOpacity: 0.65, travel: travel), startPoint: start, endPoint: end), lineWidth: 1.3)
+        context.stroke(
+            main,
+            with: .color(color.opacity(0.8)),
+            style: StrokeStyle(lineWidth: 1.4, lineCap: .round, dash: dashPattern, dashPhase: phase)
+        )
 
-        let tipOpacity = min(1.0, 0.85 + bump(at: 1.0, travel: travel))
-        context.fill(via(at: end), with: .color(color.opacity(tipOpacity)))
+        context.fill(via(at: end), with: .color(color))
 
         guard spec.hasBranch else { return }
         let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
         let perp = (dx: -rdy, dy: rdx)
         let branchLength: CGFloat = 10
         let branchEnd = CGPoint(x: mid.x + perp.dx * branchLength, y: mid.y + perp.dy * branchLength)
-        let branchOpacity = min(1.0, 0.5 + bump(at: 0.5, travel: travel))
 
         var branch = Path()
         branch.move(to: mid)
         branch.addLine(to: branchEnd)
-        context.stroke(branch, with: .color(color.opacity(branchOpacity)), lineWidth: 1.1)
-        context.fill(via(at: branchEnd, size: padSize * 0.6), with: .color(color.opacity(branchOpacity)))
+        context.stroke(branch, with: .color(color.opacity(0.5)), lineWidth: 1.1)
+        context.fill(via(at: branchEnd, size: padSize * 0.6), with: .color(color.opacity(0.8)))
     }
 
     private func via(at point: CGPoint, size: CGFloat? = nil) -> Path {

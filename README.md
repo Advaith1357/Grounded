@@ -7,8 +7,8 @@ genuinely shows the task is done. Every verified task pays a flat **10V**
 phone for a timed break; **Re-Ground** ends it early. While your queue is
 empty, a trickle charge passively banks +1V every 5 minutes, capped at 20V.
 
-**Real screen-time blocking is stubbed in this build** — see
-[What's stubbed](#5-whats-stubbed).
+Blocking uses Apple's Screen Time APIs and needs a paid developer account and a
+real device — see [§5](#5-screen-time-enforcement-real-needs-a-paid-account).
 
 ---
 
@@ -123,45 +123,103 @@ You do **not** need a paid Apple Developer account.
 - Apps signed with a free account **stop launching after 7 days**. Re-run from
   Xcode to refresh for another 7 days.
 - You can have at most **3 apps** sideloaded with a free account at once.
-- Some entitlements (including **Family Controls**, which real screen-time
-  enforcement needs) are **not available** on a free account at all.
+- **Family Controls** (real screen-time enforcement) is **not available** on a
+  free account at all — see section 5.
 
 ---
 
-## 5. What's stubbed
+## 5. Screen-time enforcement (real, needs a paid account)
 
-### Screen-time enforcement — `Grounded/Services/ShieldManager.swift`
+Grounded uses Apple's Screen Time APIs (`FamilyControls`, `ManagedSettings`,
+`ManagedSettingsUI`, `DeviceActivity`), which require the **Family Controls
+entitlement** and a paid Apple Developer account. Simulator builds compile and
+launch, but authorization, the app picker, and the shield itself only work on a
+**real device**.
 
-Real enforcement needs Apple's **Family Controls** entitlement
-(`FamilyControls` / `ManagedSettings` / `DeviceActivity`), which needs a paid
-Apple Developer account — the $100/year fee this build explicitly defers. So
-this build **does not import any of those three frameworks** and **does not
-add the Family Controls capability**.
+| Piece | File |
+| --- | --- |
+| `protocol ShieldManager` + `MockShieldManager` (previews/tests only) | `Grounded/Services/ShieldManager.swift` |
+| Real shield; persists the picked apps to the App Group | `Grounded/Services/ScreenTimeShieldManager.swift` |
+| Authorization, notification permission, Circuit Breaker scheduling on launch | `Grounded/App/GroundedApp.swift` |
+| "Choose Apps to Block" picker | `Grounded/Views/Pages/Kernel/KernelSettingsSheet.swift` |
+| Shared by app + monitor: `ShieldState`, saved selection, `ShieldApplier`, activity names, schedule math | `Shared/` |
+| Interceptor screen (what a blocked app shows) | `ShieldConfiguration/` |
+| Interceptor button: posts a "open Grounded" notification and closes the app | `ShieldAction/` |
+| Re-grounds when a break ends or the Circuit Breaker opens, even if Grounded isn't running | `DeviceActivityMonitor/` |
+| Entitlements (Family Controls + App Group `group.com.grounded.app`) | `Config/*.entitlements`, declared in `project.yml` |
 
-Instead:
+### Circuit Breaker
 
-| Piece | This build | With the entitlement |
-| --- | --- | --- |
-| `protocol ShieldManager` | unchanged | unchanged |
-| Concrete shield | `MockShieldManager` — flips `state` (`.grounded` / `.unlocked`), prints to console | new `ScreenTimeShieldManager: ShieldManager` using `ManagedSettingsStore` |
-| Wiring | `GroundedApp` passes `MockShieldManager()` into `GroundedViewModel` | `GroundedApp` passes `ScreenTimeShieldManager()` instead |
+From the **Circuit Breaker** time until the **Wake Time** (both set in the
+Kernel sheet; defaults 10:00 PM and 6:00 AM), the shield is forced on and
+**Discharge is disabled**. If a break is running when the window opens it is cut
+short and the unused minutes are refunded. Enforced in-app by the view model's
+1-second tick and, when the app isn't running, by a repeating `DeviceActivity`
+schedule. `DeviceActivity` needs a window of at least 15 minutes, so a shorter
+one is still enforced in-app (and the Kernel sheet says so) but not in the
+background.
 
-**Exactly what changes when the entitlement arrives:** add the Family Controls
-capability, add a new file conforming to `ShieldManager`, and change one line
-in `GroundedApp.swift`. Nothing in the models, the view model, `GeminiService`,
-or any view needs to change — they all talk only to `ShieldManager` /
-`GroundedViewModel.shieldState`.
+### Breaks that expire while the app is closed
 
-### Nightly "Circuit Breaker" lockout
+`discharge` also registers a one-off `DeviceActivity` window ending when the
+break does, so the monitor extension re-applies the shield on time. (`DeviceActivity`
+schedules must span 15+ minutes, so a 10V break's window starts early rather
+than ending late. Schedules are minute-resolution.) The app reconciles its own
+state on next launch.
 
-The Kernel's `DatePicker` stores a time-of-day (`UserDefaults`, key
-`settings.nightlyLockoutTime`), but nothing enforces it yet — that needs a
-background scheduler (`BGTaskScheduler` or local notifications), which is out
-of scope for this pass.
+### When your developer account arrives
+
+1. `cp Config/Local.xcconfig.example Config/Local.xcconfig`, put your team ID
+   in it, then `xcodegen generate`.
+2. Build to a real device. Xcode's automatic signing registers the App IDs
+   (app + 3 extensions) and the `group.com.grounded.app` App Group.
+3. Run **Choose Apps to Block** in the Kernel sheet, then Discharge /
+   Re-Ground and watch the picked apps.
+4. Things worth checking on-device, since the Simulator can't: the break-end
+   and Circuit Breaker schedules actually fire the monitor, and the shield's
+   "Go to Grounded" button.
 
 ---
 
-## 6. Manual test script
+## 6. The Grid: friends server
+
+The Grid tab is a real social layer: join with a display name, get a 6-character
+friend code, add friends by their code, see who is `[ GROUNDED ]` or
+`[ ON A BREAK ]`, and Zap a friend to nudge them. It needs **no Apple Developer
+account** — it talks to a small server in `Server/` over plain HTTP(S).
+
+```bash
+python3 Server/server.py                 # 127.0.0.1:8787, database in Server/grounded.db
+python3 Server/server.py --host 0.0.0.0  # also reachable from a phone on your Wi-Fi
+python3 -m unittest Server/test_server.py   # server tests
+```
+
+Python 3.9+ standard library only — nothing to install. In the app, the server
+address lives in **Settings → The Grid Server** (default `http://127.0.0.1:8787`,
+which is right for the Simulator; use your Mac's LAN IP for a physical phone).
+
+How it works:
+
+- **Identity** — joining creates an account and a bearer token (kept in the
+  Keychain; the server stores only its hash). There are no passwords.
+- **Friends** — entering someone's code makes you friends *both ways at once*;
+  the code itself is the invitation, so only share it with people you want
+  seeing your status. Long-press a friend to remove them.
+- **Status** — the app reports `.grounded` / `.unlocked` (with the break's end
+  time) whenever the shield changes. A friend whose break has run out reads as
+  grounded even if their app is closed.
+- **Nudges** — one per friend per minute. They arrive the next time the
+  recipient has Grounded open (the app polls every 8 seconds in the
+  foreground); delivering to a closed app would need push notifications, which
+  need a paid developer account.
+- **Going public** — the server speaks plain HTTP. To use it beyond your own
+  network, deploy `Server/server.py` behind an HTTPS reverse proxy and put that
+  address in Settings. It validates input and rate-limits nudges but isn't
+  hardened for the open internet beyond that.
+
+---
+
+## 7. Manual test script
 
 Do this on the **Simulator**. For Path A you need either a real Gemini key
 (see [§2](#2-paste-your-gemini-api-key)) or **Mock AI Mode** switched on in the
@@ -206,7 +264,7 @@ Kernel — the latter needs no key and spends no API calls.
    **20V — 20 min**, **30V — 30 min** (options costing more than your balance
    are disabled).
 3. Pick one → header flips to `[ UNLOCKED ]`, the dial shows a countdown, and
-   the console logs `[MockShieldManager] state -> .unlocked`.
+   the selected apps are un-shielded.
 4. Tap **RE-GROUND** to end the break early — header flips back, countdown
    clears — or just wait for the countdown to hit zero, which re-grounds
    automatically.
@@ -229,12 +287,13 @@ Kernel — the latter needs no key and spends no API calls.
    for the absence of any `CFNetwork` request log lines during a submission.
 3. **The API Vault**: paste a key → **Save to Keychain** → the footer updates
    to confirm a key is saved. This takes priority over `Secrets.swift`.
-4. **Circuit Breaker**: set a time — it persists across relaunches (not yet
-   enforced; see [§5](#5-whats-stubbed)).
+4. **Circuit Breaker**: set a time — it persists across relaunches. While the
+   window is open (until your Wake Time) Home's Discharge button is disabled and says
+   so; see [§5](#5-screen-time-enforcement-real-needs-a-paid-account).
 
 ---
 
-## 7. Regenerating the Xcode project
+## 8. Regenerating the Xcode project
 
 `project.yml` is the source of truth. After changing it (or adding/moving source
 files):
@@ -248,7 +307,7 @@ xcodegen generate
 
 ---
 
-## 8. Project layout — the MVP pivot
+## 9. Project layout — the MVP pivot
 
 This is a from-scratch information-architecture rewrite of the earlier
 "Nexus" 6-frame redesign, which the product brief described as suffering from
@@ -266,17 +325,27 @@ Grounded/
   Models/            FocusTask (title + proposedProof + status), ProofType (photo/pdf only),
                      ProofSubmission, VerificationResult (flat 10V reward)
   Services/          GeminiService (actor, verify-only — no classify), PDFTextExtractor,
-                     ShieldManager (+ MockShieldManager), KeychainStore, TaskStore
-  ViewModels/        GroundedViewModel (@MainActor ObservableObject — queue, economy, shield, trickle timer)
+                     Friends/ (FriendsService, FriendsModels — friends-server client),
+                     ShieldManager (+ MockShieldManager), ScreenTimeShieldManager,
+                     NightlyLockout, KeychainStore, TaskStore
+  ViewModels/        GroundedViewModel (@MainActor ObservableObject — queue, economy, shield, trickle timer),
+                     FriendsViewModel (identity, friends, nudges, polling)
   Views/
     Pages/
       Home/           HomeView (state-bound header, CircuitNode dial, Start Task / Discharge / Re-Ground)
       Queue/           QueueView (Active card + Standby rows), AddTaskSheet
-      Insights/        InsightsView (Voltage balance, trickle buffer gauge, streak, completion rate)
-      Grid/            GridView (completed count, streak, weekly chart, recent activity)
-      Kernel/          KernelSettingsSheet (API Vault, Mock AI Mode, Circuit Breaker) — a `.sheet`, not a tab
+      Insights/        InsightsView (activity heatmap, balance, weekly Voltage chart, recent feed, streak, completion rate)
+      Grid/            GridView (join, friend code, add friend, live statuses, nudge)
+      Kernel/          KernelSettingsSheet (app picker, API Vault, Mock AI Mode, Circuit Breaker) — a `.sheet`, not a tab
     Shared/           CameraPicker, DocumentPicker (UIKit picker wrappers)
   Support/            Secrets.swift (ignored), Secrets.example.swift, Info.plist
+Shared/               Code compiled into both the app and the monitor extension
+ShieldConfiguration/  Extension: the interceptor screen
+ShieldAction/         Extension: the interceptor button
+DeviceActivityMonitor/ Extension: background re-grounding
+Config/               Entitlements, Base.xcconfig, Local.xcconfig.example
+Server/               Friends server (server.py) and its tests
+Tests/                Logic tests (schedule + Circuit Breaker math, friends client)
 project.yml           XcodeGen spec
 ```
 
@@ -299,17 +368,12 @@ project.yml           XcodeGen spec
 - **API key can live in the Keychain now**, entered via Settings, not just
   compiled into `Secrets.swift`.
 
-### Insights and The Grid: content not specified
+### Insights and The Grid
 
-The refactor brief named these two tabs but never described their content
-(only Home, Queue, and the Kernel sheet got full specs). Reasonable calls made
-to fill the gap, easy to redirect:
-
-- **The Grid** — activity history, adapted from the previous build's Power Grid
-  screen: completed-task count, streak, a 7-day Voltage chart, recent activity.
-- **Insights** — introspection on the Voltage economy itself: current balance,
-  the trickle-charge buffer's progress toward its 20V cap, longest streak, and
-  completion rate. Distinct from Grid's history focus.
+- **Insights** — analytics: a GitHub-style activity heatmap built from real
+  completion dates, the Voltage balance, the weekly Voltage chart, recent
+  Voltage feeds, longest streak, and completion rate.
+- **The Grid** — the friends list described in [§6](#6-the-grid-friends-server).
 
 ### A known Simulator-testing limitation (not an app bug)
 

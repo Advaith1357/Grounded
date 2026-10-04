@@ -11,6 +11,7 @@ import SwiftUI
 
 struct RootTabView: View {
     @ObservedObject var viewModel: GroundedViewModel
+    @EnvironmentObject private var friends: FriendsViewModel
     @State private var selectedTab: AppTab = .home
 
     var body: some View {
@@ -23,6 +24,19 @@ struct RootTabView: View {
         }
         .tint(NexusColor.accent)
         .preferredColorScheme(.dark)
+        .overlay(alignment: .top) {
+            if let nudge = friends.incomingNudges.first {
+                NudgeBanner(nudge: nudge) { friends.dismiss(nudge) }
+                    .padding(.horizontal, NexusMetrics.screenPadding)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task(id: nudge.id) {
+                        try? await Task.sleep(for: .seconds(6))
+                        friends.dismiss(nudge)
+                    }
+            }
+        }
+        .animation(.default, value: friends.incomingNudges)
         .alert(
             "Something went wrong",
             isPresented: Binding(
@@ -54,5 +68,6 @@ struct RootTabView: View {
 #if DEBUG
 #Preview {
     RootTabView(viewModel: .previewQueue())
+        .environmentObject(FriendsViewModel.preview())
 }
 #endif

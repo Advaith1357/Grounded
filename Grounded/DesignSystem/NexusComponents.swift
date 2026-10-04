@@ -7,8 +7,8 @@
 
 import SwiftUI
 
-/// Outlined rectangle, accent text — the design's primary action (START
-/// TASK, RE-GROUND). Sketched as a plain bordered box, not a filled capsule.
+/// Solid yellow capsule, black text — the design's primary action (SUBMIT
+/// TASK, RE-GROUND).
 struct NexusPrimaryButton: View {
     let title: String
     var isEnabled = true
@@ -17,40 +17,36 @@ struct NexusPrimaryButton: View {
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(NexusFont.sans(16, weight: .bold))
+                .font(NexusFont.mono(16, weight: .bold))
                 .frame(maxWidth: .infinity)
                 .frame(height: 52)
         }
-        .foregroundStyle(NexusColor.accent)
-        .overlay(
-            RoundedRectangle(cornerRadius: NexusMetrics.chipRadius)
-                .stroke(NexusColor.accent, lineWidth: 1.5)
-        )
+        .foregroundStyle(NexusColor.background)
+        .background(NexusColor.accent)
+        .clipShape(Capsule())
         .disabled(!isEnabled)
         .opacity(isEnabled ? 1 : 0.4)
     }
 }
 
-/// Outlined rectangle, muted border — a lower-emphasis secondary action
-/// (DISCHARGE, ABORT MISSION). Same bordered-box shape as the primary
-/// button, just a quieter border so it doesn't compete with it.
+/// Clear background, yellow text and border — a lower-emphasis secondary
+/// action (DISCHARGE, ABORT MISSION).
 struct NexusSecondaryButton: View {
     let title: String
-    var tint: Color = NexusColor.textSecondary
+    var tint: Color = NexusColor.accent
     var isEnabled = true
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(NexusFont.sans(14, weight: .semibold))
+                .font(NexusFont.mono(14, weight: .semibold))
                 .frame(maxWidth: .infinity)
                 .frame(height: 48)
         }
         .foregroundStyle(tint)
         .overlay(
-            RoundedRectangle(cornerRadius: NexusMetrics.chipRadius)
-                .stroke(tint.opacity(0.5), lineWidth: 1)
+            Capsule().stroke(tint, lineWidth: 1.5)
         )
         .disabled(!isEnabled)
         .opacity(isEnabled ? 1 : 0.4)

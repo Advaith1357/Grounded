@@ -2,22 +2,45 @@
 //  KeychainStore.swift
 //  Grounded
 //
-//  Minimal Keychain read/write for the Gemini API key — no third-party
-//  packages, just the Security framework. The Kernel settings sheet's
-//  SecureField writes here; GeminiService reads from here first (falling back
-//  to the compiled `Secrets.geminiAPIKey` placeholder — see its doc comment —
-//  so the existing dev setup keeps working until you paste a key in Settings).
+//  Minimal Keychain read/write — no third-party packages, just the Security
+//  framework. Holds the Gemini API key (written by the Kernel sheet's
+//  SecureField; GeminiService reads it first and falls back to the compiled
+//  `Secrets.geminiAPIKey` placeholder) and the friends-server bearer token.
 //
 
 import Foundation
 import Security
 
 enum KeychainStore {
-    private static let service = "com.grounded.app.gemini"
-    private static let account = "gemini-api-key"
+
+    // MARK: - Gemini API key
 
     static func saveGeminiAPIKey(_ key: String) {
-        let data = Data(key.utf8)
+        save(key, service: "com.grounded.app.gemini", account: "gemini-api-key")
+    }
+
+    static func loadGeminiAPIKey() -> String? {
+        load(service: "com.grounded.app.gemini", account: "gemini-api-key")
+    }
+
+    // MARK: - Friends server token
+
+    static func saveFriendsToken(_ token: String) {
+        save(token, service: "com.grounded.app.friends", account: "friends-token")
+    }
+
+    static func loadFriendsToken() -> String? {
+        load(service: "com.grounded.app.friends", account: "friends-token")
+    }
+
+    static func deleteFriendsToken() {
+        save("", service: "com.grounded.app.friends", account: "friends-token")
+    }
+
+    // MARK: - Generic
+
+    /// Saving an empty string deletes the item.
+    private static func save(_ value: String, service: String, account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -25,14 +48,14 @@ enum KeychainStore {
         ]
         SecItemDelete(query as CFDictionary)
 
-        guard !key.isEmpty else { return }
+        guard !value.isEmpty else { return }
 
         var attributes = query
-        attributes[kSecValueData as String] = data
+        attributes[kSecValueData as String] = Data(value.utf8)
         SecItemAdd(attributes as CFDictionary, nil)
     }
 
-    static func loadGeminiAPIKey() -> String? {
+    private static func load(service: String, account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -43,10 +66,10 @@ enum KeychainStore {
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data,
-              let key = String(data: data, encoding: .utf8),
-              !key.isEmpty else {
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else {
             return nil
         }
-        return key
+        return value
     }
 }

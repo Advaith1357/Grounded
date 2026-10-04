@@ -22,6 +22,13 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Grounded connects to your friends server on the local network while you are developing or testing.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Grounded uses the camera so you can photograph finished work as proof a task is done.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

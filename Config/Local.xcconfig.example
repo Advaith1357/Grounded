@@ -1,0 +1,3 @@
+// Copy to Local.xcconfig (gitignored) and fill in, then run `xcodegen generate`.
+// Find your team ID at developer.apple.com/account -> Membership details.
+DEVELOPMENT_TEAM = ABCDE12345

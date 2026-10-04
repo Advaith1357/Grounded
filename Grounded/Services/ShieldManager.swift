@@ -2,46 +2,29 @@
 //  ShieldManager.swift
 //  Grounded
 //
-//  ============================================================================
-//  STUB BOUNDARY — real screen-time enforcement is intentionally NOT
-//  implemented here.
-//  ============================================================================
+//  The shield abstraction. `ScreenTimeShieldManager` is the real implementation
+//  (FamilyControls / ManagedSettings / DeviceActivity); `MockShieldManager`
+//  below only exists for SwiftUI previews and test fixtures, where the Screen
+//  Time frameworks can't run. The view model and every view talk only to
+//  `ShieldManager` / `GroundedViewModel.shieldState`. `ShieldState` itself
+//  lives in Shared/ so the DeviceActivityMonitor extension can use it too.
 //
-//  Real enforcement requires Apple's Family Controls entitlement
-//  (FamilyControls / ManagedSettings / DeviceActivity), which needs a paid
-//  Apple Developer account. That $100/year fee is explicitly deferred for now,
-//  so this build must never import any of those three frameworks and never add
-//  the Family Controls capability. `MockShieldManager` just flips `state` and
-//  logs to the console — good enough to drive every other feature (queue,
-//  economy, Gemini verification) in the Simulator.
-//
-//  When the entitlement is available: add a `ScreenTimeShieldManager` that
-//  conforms to this same `ShieldManager` protocol and inject it in
-//  `GroundedApp` instead of `MockShieldManager`. Nothing outside this file
-//  should need to change — the view model and every view talk only to
-//  `ShieldManager` / `GroundedViewModel.shieldState`.
-//
-//  Do NOT `import FamilyControls`, `ManagedSettings`, or `DeviceActivity` in
-//  this build.
-//  ============================================================================
 
 import Foundation
 import Combine
-
-/// The device's screen-time state. `.grounded` is the default/rest state
-/// (apps restricted); `.unlocked` is a spent-Voltage break.
-enum ShieldState: String {
-    case grounded
-    case unlocked
-}
 
 protocol ShieldManager: AnyObject {
     var state: ShieldState { get }
     func ground()
     func unlock()
+
+    /// Asks the OS to re-ground at `date` even if the app is no longer
+    /// running (a Discharge break expiring while the app is killed).
+    func scheduleReGround(at date: Date)
+    func cancelScheduledReGround()
 }
 
-/// Simulated shield. Flips `state` and prints; no system side effects.
+/// Preview/test-only shield. Flips `state` and prints; no system side effects.
 final class MockShieldManager: ObservableObject, ShieldManager {
 
     @Published private(set) var state: ShieldState = .grounded
@@ -54,5 +37,13 @@ final class MockShieldManager: ObservableObject, ShieldManager {
     func unlock() {
         state = .unlocked
         print("[MockShieldManager] state -> .unlocked")
+    }
+
+    func scheduleReGround(at date: Date) {
+        print("[MockShieldManager] scheduleReGround(at: \(date))")
+    }
+
+    func cancelScheduledReGround() {
+        print("[MockShieldManager] cancelScheduledReGround()")
     }
 }

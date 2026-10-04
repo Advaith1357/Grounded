@@ -38,18 +38,22 @@ struct HomeView: View {
                         VStack(spacing: 4) {
                             if viewModel.shieldState == .unlocked {
                                 Text(Self.timeString(viewModel.unlockRemaining))
-                                    .font(NexusFont.mono(44, weight: .heavy))
+                                    .font(.system(size: 64, weight: .heavy, design: .monospaced))
                                     .foregroundStyle(NexusColor.gold)
                                     .monospacedDigit()
-                                Text("REMAINING")
+                                    .minimumScaleFactor(0.5)
+                                    .lineLimit(1)
+                                Text("DISCHARGING")
                                     .font(NexusFont.mono(12))
                                     .foregroundStyle(NexusColor.textSecondary)
                             } else {
                                 Text("\(viewModel.economy.voltageBalance)")
-                                    .font(NexusFont.mono(60, weight: .heavy))
+                                    .font(.system(size: 64, weight: .heavy, design: .monospaced))
                                     .foregroundStyle(NexusColor.accent)
                                     .monospacedDigit()
-                                Text("AVAILABLE")
+                                    .minimumScaleFactor(0.5)
+                                    .lineLimit(1)
+                                Text("1V = 1 MIN")
                                     .font(NexusFont.mono(12))
                                     .foregroundStyle(NexusColor.textSecondary)
                             }
@@ -91,7 +95,7 @@ struct HomeView: View {
         case .grounded:
             VStack(spacing: 12) {
                 NexusPrimaryButton(title: "START TASK", action: switchToQueue)
-                NexusSecondaryButton(title: "DISCHARGE") {
+                NexusSecondaryButton(title: "DISCHARGE", isEnabled: !viewModel.nightlyLockoutActive) {
                     showDischargeDialog = true
                 }
                 .confirmationDialog(
@@ -104,6 +108,12 @@ struct HomeView: View {
                             .disabled(viewModel.economy.voltageBalance < amount)
                     }
                     Button("Cancel", role: .cancel) { }
+                }
+
+                if viewModel.nightlyLockoutActive {
+                    Text("CIRCUIT BREAKER ACTIVE UNTIL \(NightlyLockout.current.endTimeText())")
+                        .font(NexusFont.mono(11))
+                        .foregroundStyle(NexusColor.textSecondary)
                 }
             }
         case .unlocked:
@@ -137,9 +147,11 @@ struct HomeView: View {
 #if DEBUG
 #Preview("Grounded") {
     RootTabView(viewModel: .previewIdle())
+        .environmentObject(FriendsViewModel.preview())
 }
 
 #Preview("Unlocked") {
     RootTabView(viewModel: .previewUnlocked())
+        .environmentObject(FriendsViewModel.preview())
 }
 #endif
