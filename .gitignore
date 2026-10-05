@@ -21,3 +21,17 @@ Config/Local.xcconfig
 Server/*.db
 Server/*.db-*
 __pycache__/
+
+# Additional patterns from GitHub's Swift template
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+.build/
+Carthage/Build/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
