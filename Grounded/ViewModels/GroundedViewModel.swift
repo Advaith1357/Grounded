@@ -48,14 +48,15 @@ final class GroundedViewModel: ObservableObject {
     @Published var lastResult: VerificationResult?
     @Published var errorMessage: String?
 
-    private static let trickleInterval: TimeInterval = 5 * 60
-    private static let trickleCap = 20
+    private static let trickleInterval = TrickleSchedule.interval
+    private static let trickleCap = TrickleSchedule.cap
 
     // MARK: - Dependencies
 
     private let store: TaskStore
     private let gemini: GeminiProviding
     let shield: ShieldManager
+    private let notifier: GroundingNotifier
 
     private var tickTimer: Timer?
 
@@ -64,11 +65,13 @@ final class GroundedViewModel: ObservableObject {
     init(
         store: TaskStore = TaskStore(),
         gemini: GeminiProviding = GeminiService(),
-        shield: ShieldManager
+        shield: ShieldManager,
+        notifier: GroundingNotifier
     ) {
         self.store = store
         self.gemini = gemini
         self.shield = shield
+        self.notifier = notifier
 
         rebuildFromStore()
 
@@ -80,6 +83,7 @@ final class GroundedViewModel: ObservableObject {
             shield.unlock()
             shieldState = .unlocked
             shield.scheduleReGround(at: endsAt)
+            notifier.scheduleBreakWarning(endsAt: endsAt)
         } else {
             if let endsAt = economy.unlockEndsAt {
                 var e = economy
@@ -88,6 +92,7 @@ final class GroundedViewModel: ObservableObject {
                 store.setEconomy(e)
                 economy = e
             }
+            notifier.cancelBreakWarning()
             shield.ground()
             shieldState = .grounded
         }
@@ -225,6 +230,7 @@ final class GroundedViewModel: ObservableObject {
 
         shield.unlock()
         shield.scheduleReGround(at: endsAt)
+        notifier.scheduleBreakWarning(endsAt: endsAt)
         shieldState = .unlocked
         updateUnlockRemaining()
     }
@@ -243,6 +249,7 @@ final class GroundedViewModel: ObservableObject {
         economy = e
 
         shield.cancelScheduledReGround()
+        notifier.cancelBreakWarning()
         shield.ground()
         shieldState = .grounded
         unlockRemaining = 0
@@ -272,8 +279,7 @@ final class GroundedViewModel: ObservableObject {
 
     private func catchUpTrickle() {
         guard taskQueue.isEmpty else { return }
-        let elapsed = Date().timeIntervalSince(economy.lastTrickleAt)
-        let wholeTicks = Int(elapsed / Self.trickleInterval)
+        let wholeTicks = TrickleSchedule.ticksDue(lastTrickleAt: economy.lastTrickleAt, now: Date())
         guard wholeTicks > 0 else { return }
 
         var e = economy
@@ -349,8 +355,20 @@ enum SettingsKey {
     static let mockAIMode = "settings.mockAIMode"
     static let nightlyLockoutTime = "settings.nightlyLockoutTime"
     static let nightlyWakeTime = "settings.nightlyWakeTime"
+    static let onboardingCompleted = "onboarding.completed"
+    static let phoneHoursPerDay = "onboarding.phoneHoursPerDay"
+    static let userAge = "onboarding.age"
+    /// Maximum screen time per day, in minutes (1V = 1 minute). Set in onboarding.
+    static let dailyLimitMinutes = "settings.dailyLimitMinutes"
     static let friendsServerURL = "settings.friendsServerURL"
-    static let defaultFriendsServerURL = "http://127.0.0.1:8787"
+    /// The hosted server set at build time via FRIENDS_SERVER_HOST in
+    /// Config/Local.xcconfig, else the local development server. A value typed
+    /// into Settings overrides this.
+    static var defaultFriendsServerURL: String {
+        let host = (Bundle.main.object(forInfoDictionaryKey: "GroundedFriendsServerHost") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return host.isEmpty ? "http://127.0.0.1:8787" : "https://\(host)"
+    }
 
     /// 10:00 PM today, encoded as `timeIntervalSinceReferenceDate` (only the
     /// time-of-day portion is ever read back out via `.hourAndMinute`/`.shortened`).
@@ -412,7 +430,7 @@ extension GroundedViewModel {
 
         store.setEconomy(EconomyState(voltageBalance: 34, lastTrickleAt: Date(), unlockEndsAt: nil, currentStreak: 1, longestStreak: 4, lastCompletionDate: Date()))
 
-        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager())
+        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager(), notifier: NoopGroundingNotifier())
     }
 
     /// A 2-item queue: one Active, one Standby.
@@ -421,14 +439,14 @@ extension GroundedViewModel {
         store.upsert(FocusTask(title: "Finish matrices homework", proposedProof: "Photo of the worked page"))
         store.upsert(FocusTask(title: "Write the lab report", proposedProof: "PDF export from Pages"))
         store.setEconomy(EconomyState(voltageBalance: 12, lastTrickleAt: Date(), unlockEndsAt: nil, currentStreak: 2, longestStreak: 4, lastCompletionDate: Date()))
-        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager())
+        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager(), notifier: NoopGroundingNotifier())
     }
 
     /// Mid-Discharge break.
     static func previewUnlocked() -> GroundedViewModel {
         let store = previewStore()
         store.setEconomy(EconomyState(voltageBalance: 15, lastTrickleAt: Date(), unlockEndsAt: Date().addingTimeInterval(600), currentStreak: 0, longestStreak: 2, lastCompletionDate: nil))
-        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager())
+        return GroundedViewModel(store: store, gemini: FakeGeminiService(), shield: MockShieldManager(), notifier: NoopGroundingNotifier())
     }
 }
 #endif
