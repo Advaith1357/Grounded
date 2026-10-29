@@ -20,6 +20,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>GroundedFriendsServerHost</key>
+	<string>$(FRIENDS_SERVER_HOST)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -27,10 +29,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Grounded connects to your friends server on the local network while you are developing or testing.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Grounded uses the camera so you can photograph finished work as proof a task is done.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Grounded connects to your friends server on the local network while you are developing or testing.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Grounded needs access to your photo library so you can pick an existing photo as proof a task is done.</string>
 	<key>UILaunchScreen</key>

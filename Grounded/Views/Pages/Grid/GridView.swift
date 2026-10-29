@@ -47,6 +47,8 @@ struct GridView: View {
             }
             .navigationTitle("The Grid")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { friends.setFastPolling(true) }
+            .onDisappear { friends.setFastPolling(false) }
             .toolbar {
                 if friends.isJoined {
                     ToolbarItem(placement: .topBarTrailing) {

@@ -109,15 +109,21 @@ final class FriendsServiceTests: XCTestCase {
         XCTAssertEqual(try JSONSerialization.jsonObject(with: body) as? [String: String], ["name": "Alex"])
     }
 
-    func testFetchFriendsSendsBearerTokenAndDecodesDates() async throws {
+    func testSyncSendsBearerTokenAndDecodesFriendsAndNudges() async throws {
         StubURLProtocol.handler = { _, _ in
-            .init(body: self.json(["friends": [
-                ["id": "2", "name": "Jordan", "state": "unlocked", "unlockEndsAt": 1_000_600.5, "statusUpdatedAt": 1_000_000.0],
-                ["id": "3", "name": "Sam", "state": "grounded", "unlockEndsAt": NSNull(), "statusUpdatedAt": 999_000.0],
-            ]]))
+            .init(body: self.json([
+                "friends": [
+                    ["id": "2", "name": "Jordan", "state": "unlocked", "unlockEndsAt": 1_000_600.5, "statusUpdatedAt": 1_000_000.0],
+                    ["id": "3", "name": "Sam", "state": "grounded", "unlockEndsAt": NSNull(), "statusUpdatedAt": 999_000.0],
+                ],
+                "nudges": [["id": 7, "fromId": "2", "fromName": "Jordan", "createdAt": 1_000_100.0]],
+            ]))
         }
-        let friends = try await makeService().fetchFriends(token: "tok")
+        let result = try await makeService().sync(token: "tok")
+        let friends = result.friends
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.path, "/v1/sync")
         XCTAssertEqual(StubURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+        XCTAssertEqual(result.nudges, [Nudge(id: 7, fromId: "2", fromName: "Jordan", createdAt: Date(timeIntervalSince1970: 1_000_100))])
         XCTAssertEqual(friends.map(\.name), ["Jordan", "Sam"])
         XCTAssertEqual(friends[0].state, .unlocked)
         XCTAssertEqual(friends[0].unlockEndsAt, Date(timeIntervalSince1970: 1_000_600.5))
@@ -144,7 +150,7 @@ final class FriendsServiceTests: XCTestCase {
         let service = makeService()
 
         StubURLProtocol.handler = { _, _ in .init(status: 401, body: self.json(["error": "x"])) }
-        await assertThrows(FriendsError.unauthorized) { _ = try await service.fetchFriends(token: "t") }
+        await assertThrows(FriendsError.unauthorized) { _ = try await service.sync(token: "t") }
 
         StubURLProtocol.handler = { _, _ in .init(status: 429, headers: ["Retry-After": "42"], body: self.json(["error": "slow down"])) }
         await assertThrows(FriendsError.rateLimited(retryAfter: 42)) { try await service.sendNudge(to: "2", token: "t") }
@@ -153,27 +159,37 @@ final class FriendsServiceTests: XCTestCase {
         await assertThrows(FriendsError.server("No one has that friend code.")) { _ = try await service.addFriend(code: "AAAAAA", token: "t") }
 
         StubURLProtocol.handler = { _, _ in .init(status: 500, body: Data("<html>".utf8)) }
-        await assertThrows(FriendsError.server("The friends server returned an error (500).")) { _ = try await service.fetchNudges(token: "t") }
+        await assertThrows(FriendsError.server("The friends server returned an error (500).")) { _ = try await service.sync(token: "t") }
 
         StubURLProtocol.handler = { _, _ in .init(body: Data("not json".utf8)) }
-        await assertThrows(FriendsError.invalidResponse) { _ = try await service.fetchFriends(token: "t") }
+        await assertThrows(FriendsError.invalidResponse) { _ = try await service.sync(token: "t") }
 
         StubURLProtocol.handler = { _, _ in .init(error: URLError(.cannotConnectToHost)) }
-        await assertThrows(FriendsError.unreachable) { _ = try await service.fetchFriends(token: "t") }
+        await assertThrows(FriendsError.unreachable(address: "http://127.0.0.1:8787")) { _ = try await service.sync(token: "t") }
     }
 
     func testInvalidServerAddress() async {
         for bad in ["", "not a url", "ftp://example.com", "http://"] {
             await assertThrows(FriendsError.invalidServerURL, "\(bad)") {
-                _ = try await self.makeService(baseURL: bad).fetchFriends(token: "t")
+                _ = try await self.makeService(baseURL: bad).sync(token: "t")
             }
         }
     }
 
     func testServerAddressWithPathAndTrailingSlash() async throws {
-        StubURLProtocol.handler = { _, _ in .init(body: self.json(["friends": []])) }
-        _ = try await makeService(baseURL: "  https://example.com/api/  ").fetchFriends(token: "t")
-        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.absoluteString, "https://example.com/api/v1/friends")
+        StubURLProtocol.handler = { _, _ in .init(body: self.json(["friends": [], "nudges": []])) }
+        _ = try await makeService(baseURL: "  https://example.com/api/  ").sync(token: "t")
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.absoluteString, "https://example.com/api/v1/sync")
+    }
+
+    func testPingHitsTheHealthEndpointWithoutCredentials() async throws {
+        StubURLProtocol.handler = { _, _ in .init(body: self.json(["ok": true])) }
+        try await makeService().ping()
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.path, "/health")
+        XCTAssertNil(StubURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"))
+
+        StubURLProtocol.handler = { _, _ in .init(error: URLError(.timedOut)) }
+        await assertThrows(FriendsError.unreachable(address: "http://127.0.0.1:8787")) { try await self.makeService().ping() }
     }
 
     func testRemoveFriendEscapesTheID() async throws {
@@ -195,5 +211,46 @@ final class FriendsServiceTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? FriendsError, expected, message, file: file, line: line)
         }
+    }
+}
+
+// MARK: - "Can't connect" diagnostics
+
+final class UnreachableMessageTests: XCTestCase {
+
+    func testAddressClassification() {
+        for loopback in ["http://127.0.0.1:8787", "http://localhost:8787", "http://127.1.2.3", "http://[::1]:8787"] {
+            XCTAssertEqual(FriendsError.AddressKind(loopback), .loopback, loopback)
+        }
+        for lan in ["http://192.168.1.20:8787", "http://10.0.0.5:8787", "http://172.16.4.1", "http://172.31.255.1", "http://my-mac.local:8787"] {
+            XCTAssertEqual(FriendsError.AddressKind(lan), .privateNetwork, lan)
+        }
+        for other in ["https://grounded.pythonanywhere.com", "http://172.32.0.1", "http://172.15.0.1", "http://8.8.8.8", "garbage", ""] {
+            XCTAssertEqual(FriendsError.AddressKind(other), .other, other)
+        }
+    }
+
+    func testLoopbackOnSimulatorSaysToStartTheServer() {
+        let message = FriendsError.unreachableMessage(address: "http://127.0.0.1:8787", onSimulator: true)
+        XCTAssertTrue(message.contains("http://127.0.0.1:8787"))
+        XCTAssertTrue(message.contains("python3 Server/server.py"))
+    }
+
+    func testLoopbackOnAPhoneExplainsThePhoneIsNotYourMac() {
+        let message = FriendsError.unreachableMessage(address: "http://127.0.0.1:8787", onSimulator: false)
+        XCTAssertTrue(message.contains("the phone itself"))
+        XCTAssertFalse(message.contains("python3"))
+    }
+
+    func testLANAddressMentionsTheLocalNetworkPermission() {
+        let message = FriendsError.unreachableMessage(address: "http://192.168.1.20:8787", onSimulator: false)
+        XCTAssertTrue(message.contains("Local Network"))
+    }
+
+    func testHostedAddressGivesGenericAdvice() {
+        let message = FriendsError.unreachableMessage(address: "https://grounded.pythonanywhere.com", onSimulator: false)
+        XCTAssertTrue(message.contains("grounded.pythonanywhere.com"))
+        XCTAssertFalse(message.contains("Local Network"))
+        XCTAssertFalse(message.contains("python3"))
     }
 }

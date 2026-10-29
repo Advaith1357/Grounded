@@ -14,11 +14,13 @@ protocol FriendsProviding: Sendable {
     func register(name: String) async throws -> Registration
     func deleteAccount(token: String) async throws
     func updateStatus(_ state: FriendState, unlockEndsAt: Date?, token: String) async throws
-    func fetchFriends(token: String) async throws -> [Friend]
+    /// Friends (with live status) and pending nudges in one request.
+    func sync(token: String) async throws -> SyncResult
+    /// Throws unless the server answers its health check.
+    func ping() async throws
     func addFriend(code: String, token: String) async throws -> Friend
     func removeFriend(id: String, token: String) async throws
     func sendNudge(to friendID: String, token: String) async throws
-    func fetchNudges(token: String) async throws -> [Nudge]
     func acknowledgeNudges(ids: [Int], token: String) async throws
 }
 
@@ -51,9 +53,12 @@ final class FriendsService: FriendsProviding {
         _ = try await perform("PUT", "/v1/me/status", body: body, token: token)
     }
 
-    func fetchFriends(token: String) async throws -> [Friend] {
-        struct Response: Decodable { let friends: [Friend] }
-        return try decode(Response.self, from: try await perform("GET", "/v1/friends", token: token)).friends
+    func sync(token: String) async throws -> SyncResult {
+        try decode(SyncResult.self, from: try await perform("GET", "/v1/sync", token: token))
+    }
+
+    func ping() async throws {
+        _ = try await perform("GET", "/health", token: nil)
     }
 
     func addFriend(code: String, token: String) async throws -> Friend {
@@ -73,11 +78,6 @@ final class FriendsService: FriendsProviding {
 
     func sendNudge(to friendID: String, token: String) async throws {
         _ = try await perform("POST", "/v1/nudges", body: ["to": friendID], token: token)
-    }
-
-    func fetchNudges(token: String) async throws -> [Nudge] {
-        struct Response: Decodable { let nudges: [Nudge] }
-        return try decode(Response.self, from: try await perform("GET", "/v1/nudges", token: token)).nudges
     }
 
     func acknowledgeNudges(ids: [Int], token: String) async throws {
@@ -109,6 +109,7 @@ final class FriendsService: FriendsProviding {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
 
+        let address = baseURL().trimmingCharacters(in: .whitespacesAndNewlines)
         let data: Data
         let response: URLResponse
         do {
@@ -117,7 +118,7 @@ final class FriendsService: FriendsProviding {
             throw CancellationError()
         } catch {
             if (error as? URLError)?.code == .cancelled { throw CancellationError() }
-            throw FriendsError.unreachable
+            throw FriendsError.unreachable(address: address)
         }
 
         guard let http = response as? HTTPURLResponse else { throw FriendsError.invalidResponse }

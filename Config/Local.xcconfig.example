@@ -1,3 +1,12 @@
 // Copy to Local.xcconfig (gitignored) and fill in, then run `xcodegen generate`.
+
 // Find your team ID at developer.apple.com/account -> Membership details.
+// (Only needed for a paid developer account / Screen Time.)
 DEVELOPMENT_TEAM = ABCDE12345
+
+// Your hosted friends server (see README, "Hosting the friends server for free").
+FRIENDS_SERVER_HOST = yourname.pythonanywhere.com
+
+// Make the bundle ID your own (reverse-domain, globally unique). Needed if
+// Xcode says the identifier "cannot be registered to your development team".
+GROUNDED_BUNDLE_ID = com.yourname.grounded

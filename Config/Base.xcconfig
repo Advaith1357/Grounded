@@ -1,4 +1,15 @@
 // Committed. Anything personal goes in Local.xcconfig (gitignored).
+
+// Host of your hosted friends server, e.g. yourname.pythonanywhere.com
+// (no scheme, no slashes: "//" starts a comment in xcconfig files).
+// Empty means "use the local development server" (http://127.0.0.1:8787).
+FRIENDS_SERVER_HOST =
+
+// The app's bundle ID; the three extensions are suffixed onto it. A generic ID
+// is probably already registered by another developer, which breaks signing
+// with "Failed to register bundle identifier": override it in Local.xcconfig.
+GROUNDED_BUNDLE_ID = com.grounded.app
+
 // The leading "?" makes the include optional, so a fresh clone still builds
 // for the simulator without it.
 #include? "Local.xcconfig"

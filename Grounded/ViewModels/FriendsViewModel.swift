@@ -38,7 +38,11 @@ final class FriendsViewModel: ObservableObject {
     private var statusIsStale = false
 
     private static let profileKey = "friends.profile"
-    private static let pollInterval: Duration = .seconds(8)
+    /// Quick while the Grid tab is on screen; slow elsewhere (nudges still
+    /// arrive, just a little later) so a free host isn't hit needlessly.
+    private static let fastPollInterval: Duration = .seconds(8)
+    private static let slowPollInterval: Duration = .seconds(30)
+    private var pollInterval = FriendsViewModel.slowPollInterval
 
     // MARK: - Init
 
@@ -176,9 +180,9 @@ final class FriendsViewModel: ObservableObject {
         await flushStatus()
         guard self.token != nil else { return }
         do {
-            friends = try await service.fetchFriends(token: token)
-            let nudges = try await service.fetchNudges(token: token)
-            receive(nudges, token: token)
+            let result = try await service.sync(token: token)
+            friends = result.friends
+            receive(result.nudges, token: token)
             if !silent { errorMessage = nil }
         } catch FriendsError.unauthorized {
             handleUnauthorized()
@@ -206,14 +210,36 @@ final class FriendsViewModel: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh(silent: true)
-                try? await Task.sleep(for: Self.pollInterval)
+                guard let interval = self?.pollInterval else { return }
+                try? await Task.sleep(for: interval)
             }
         }
+    }
+
+    /// The Grid tab calls this as it appears/disappears. Speeding up refreshes
+    /// immediately so the list is current the moment the tab opens.
+    func setFastPolling(_ fast: Bool) {
+        pollInterval = fast ? Self.fastPollInterval : Self.slowPollInterval
+        guard fast, pollTask != nil, isJoined else { return }
+        stopPolling()
+        startPolling()
     }
 
     func stopPolling() {
         pollTask?.cancel()
         pollTask = nil
+    }
+
+    // MARK: - Connection check
+
+    /// For the Settings "Test connection" button: a plain-language result.
+    func testConnection() async -> (ok: Bool, message: String) {
+        do {
+            try await service.ping()
+            return (true, "Connected.")
+        } catch {
+            return (false, (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 
     // MARK: - Errors
@@ -256,13 +282,13 @@ private struct PreviewFriendsService: FriendsProviding {
     }
     func deleteAccount(token: String) async throws {}
     func updateStatus(_ state: FriendState, unlockEndsAt: Date?, token: String) async throws {}
-    func fetchFriends(token: String) async throws -> [Friend] { [] }
+    func sync(token: String) async throws -> SyncResult { SyncResult(friends: [], nudges: []) }
+    func ping() async throws {}
     func addFriend(code: String, token: String) async throws -> Friend {
         Friend(id: "x", name: "New", state: .grounded, unlockEndsAt: nil, statusUpdatedAt: Date())
     }
     func removeFriend(id: String, token: String) async throws {}
     func sendNudge(to friendID: String, token: String) async throws {}
-    func fetchNudges(token: String) async throws -> [Nudge] { [] }
     func acknowledgeNudges(ids: [Int], token: String) async throws {}
 }
 #endif
