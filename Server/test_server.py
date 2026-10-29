@@ -1,5 +1,6 @@
 """Run with: python3 -m unittest Server/test_server.py  (from the repo root)"""
 
+import io
 import json
 import os
 import sys
@@ -8,6 +9,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from wsgiref.simple_server import WSGIRequestHandler, make_server as make_wsgi_server
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server  # noqa: E402
@@ -21,11 +23,21 @@ class FakeClock:
         return self.now
 
 
+class QuietHandler(WSGIRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
 class ServerTestCase(unittest.TestCase):
+    store_options = {}
+
+    def make_httpd(self):
+        return server.make_server(os.path.join(self.tmp.name, "t.db"), port=0, clock=self.clock, **self.store_options)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.clock = FakeClock()
-        self.httpd = server.make_server(os.path.join(self.tmp.name, "t.db"), port=0, clock=self.clock)
+        self.httpd = self.make_httpd()
         self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
@@ -199,6 +211,78 @@ class NudgeTests(ServerTestCase):
         self.befriend(a, b)
         self.call("DELETE", "/v1/friends/" + a["id"], token=b["token"])
         self.assertEqual(self.call("POST", "/v1/nudges", {"to": b["id"]}, a["token"])[0], 403)
+
+
+class SyncTests(ServerTestCase):
+    def test_sync_returns_friends_and_nudges_together(self):
+        a, b = self.register("Alex"), self.register("Jordan")
+        self.befriend(a, b)
+        self.call("POST", "/v1/nudges", {"to": b["id"]}, a["token"])
+        status, body, _ = self.call("GET", "/v1/sync", token=b["token"])
+        self.assertEqual(status, 200)
+        self.assertEqual([f["name"] for f in body["friends"]], ["Alex"])
+        self.assertEqual([n["fromName"] for n in body["nudges"]], ["Alex"])
+        self.assertEqual(self.call("GET", "/v1/sync", token=a["token"])[1]["nudges"], [])
+
+    def test_sync_requires_auth(self):
+        self.assertEqual(self.call("GET", "/v1/sync")[0], 401)
+
+
+class RegistrationCapTests(ServerTestCase):
+    store_options = {"max_users": 2}
+
+    def test_registration_closes_at_the_cap(self):
+        self.register("A")
+        self.register("B")
+        status, body, _ = self.call("POST", "/v1/users", {"name": "C"})
+        self.assertEqual(status, 503)
+        self.assertIn("accepting", body["error"])
+
+
+class DeleteJournalModeTests(ServerTestCase):
+    """The mode used on network filesystems such as PythonAnywhere's."""
+    store_options = {"journal_mode": "delete"}
+
+    def test_works_without_wal(self):
+        a, b = self.register("Alex"), self.register("Jordan")
+        self.befriend(a, b)
+        self.assertEqual(len(self.call("GET", "/v1/sync", token=a["token"])[1]["friends"]), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "t.db-wal")))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_rejects_unknown_journal_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                server.Store(os.path.join(tmp, "t.db"), journal_mode="memory")
+
+    def test_wsgi_app_opens_the_database_lazily(self):
+        # PythonAnywhere imports `application` before any request arrives.
+        self.assertTrue(callable(server.application))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lazy.db")
+            app = server.make_wsgi_app(path)
+            self.assertFalse(os.path.exists(path))
+            environ = {"REQUEST_METHOD": "GET", "PATH_INFO": "/health", "wsgi.input": io.BytesIO(b"")}
+            captured = {}
+            body = app(environ, lambda status, headers: captured.update(status=status))
+            self.assertEqual(captured["status"], "200 OK")
+            self.assertEqual(json.loads(b"".join(body)), {"ok": True})
+            self.assertTrue(os.path.exists(path))
+
+
+class WSGIMixin:
+    """Runs a test class's whole suite against the WSGI app instead of http.server."""
+
+    def make_httpd(self):
+        app = server.make_wsgi_app(os.path.join(self.tmp.name, "t.db"), clock=self.clock, **self.store_options)
+        return make_wsgi_server("127.0.0.1", 0, app, handler_class=QuietHandler)
+
+
+for _case in (RegistrationTests, FriendTests, NudgeTests, SyncTests, RegistrationCapTests):
+    _name = _case.__name__ + "OverWSGI"
+    globals()[_name] = type(_name, (WSGIMixin, _case), {})
+del _case, _name
 
 
 if __name__ == "__main__":

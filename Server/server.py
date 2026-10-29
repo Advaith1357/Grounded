@@ -8,12 +8,20 @@ nudges. Run it with:
     python3 Server/server.py                   # 127.0.0.1:8787, ./Server/grounded.db
     python3 Server/server.py --host 0.0.0.0    # reachable from a phone on your LAN
 
+It also exposes a WSGI `application` for hosts such as PythonAnywhere (see the
+README, "Hosting the friends server for free").
+
 Auth is a bearer token issued at registration; only its SHA-256 is stored.
-There is no TLS here — put it behind an HTTPS reverse proxy before exposing it
-to the internet. All times are Unix epoch seconds.
+This process speaks plain HTTP — a host that provides HTTPS (or a reverse
+proxy) must sit in front of it before it's exposed to the internet. All times
+are Unix epoch seconds.
+
+Environment: GROUNDED_DB (database path), GROUNDED_JOURNAL_MODE (wal|delete —
+use delete on network filesystems), GROUNDED_MAX_USERS (registration cap).
 """
 
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -29,6 +37,7 @@ from urllib.parse import urlparse
 MAX_BODY_BYTES = 4096
 MAX_NAME_LENGTH = 24
 MAX_FRIENDS = 50
+DEFAULT_MAX_USERS = 1000
 NUDGE_COOLDOWN_SECONDS = 60
 NUDGE_RETENTION_SECONDS = 7 * 24 * 3600
 # No 0/O/1/I so codes survive being read aloud or typed from a screenshot.
@@ -107,17 +116,22 @@ def friend_json(row):
 class Store:
     """All database access. One short-lived connection per call."""
 
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, journal_mode=None, max_users=None):
         self.path = path
         self.clock = clock
-        with self._connect() as db:
+        mode = (journal_mode or os.environ.get("GROUNDED_JOURNAL_MODE") or "wal").lower()
+        if mode not in ("wal", "delete"):
+            raise ValueError("GROUNDED_JOURNAL_MODE must be 'wal' or 'delete'")
+        self.journal_mode = mode
+        self.max_users = max_users or int(os.environ.get("GROUNDED_MAX_USERS") or DEFAULT_MAX_USERS)
+        with closing(self._connect()) as db:
             db.executescript(SCHEMA)
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
-        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA journal_mode = %s" % self.journal_mode)
         return db
 
     def create_user(self, name):
@@ -126,6 +140,8 @@ class Store:
         now = self.clock()
         db = self._connect()
         try:
+            if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] >= self.max_users:
+                raise ApiError(503, "This server isn't accepting new accounts right now.")
             for _ in range(20):
                 code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
                 try:
@@ -265,6 +281,127 @@ class Store:
             db.close()
 
 
+def handle(store, method, target, authorization, content_length, read_body):
+    """Routes one request. Transport-independent: used by both the standalone
+    server and the WSGI app. Returns (status, json_payload_or_None, headers)."""
+    path = urlparse(target).path.rstrip("/") or "/"
+
+    def body_json():
+        if content_length > MAX_BODY_BYTES:
+            raise ApiError(413, "Request too large.")
+        if content_length == 0:
+            return {}
+        try:
+            data = json.loads(read_body(content_length))
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "Body must be JSON.")
+        if not isinstance(data, dict):
+            raise ApiError(400, "Body must be a JSON object.")
+        return data
+
+    def current_user():
+        if not authorization or not authorization.startswith("Bearer "):
+            raise ApiError(401, "Missing credentials.")
+        user = store.user_for_token(authorization[len("Bearer "):].strip())
+        if user is None:
+            raise ApiError(401, "Unknown or revoked credentials.")
+        return user
+
+    try:
+        if path == "/health" and method == "GET":
+            return 200, {"ok": True}, {}
+
+        if path == "/v1/users" and method == "POST":
+            name = clean_name(body_json().get("name"))
+            return 201, store.create_user(name), {}
+
+        if path == "/v1/me":
+            user = current_user()
+            if method == "GET":
+                return 200, {"id": user["id"], "name": user["name"], "code": user["code"]}, {}
+            if method == "DELETE":
+                store.delete_user(user["id"])
+                return 204, None, {}
+
+        elif path == "/v1/me/status" and method == "PUT":
+            user = current_user()
+            body = body_json()
+            state = body.get("state")
+            if state not in STATES:
+                raise ApiError(400, "state must be 'grounded' or 'unlocked'.")
+            ends_at = body.get("unlockEndsAt")
+            if state == "unlocked":
+                if (
+                    isinstance(ends_at, bool)
+                    or not isinstance(ends_at, (int, float))
+                    or not math.isfinite(ends_at)
+                ):
+                    raise ApiError(400, "unlockEndsAt is required when unlocked.")
+            else:
+                ends_at = None
+            store.set_status(user["id"], state, ends_at)
+            return 204, None, {}
+
+        elif path == "/v1/sync" and method == "GET":
+            # Friends + pending nudges in one round trip: what the app polls.
+            user = current_user()
+            return 200, {
+                "friends": store.friends_of(user["id"]),
+                "nudges": store.pending_nudges(user["id"]),
+            }, {}
+
+        elif path == "/v1/friends":
+            user = current_user()
+            if method == "GET":
+                return 200, {"friends": store.friends_of(user["id"])}, {}
+            if method == "POST":
+                code = normalize_code(body_json().get("code"))
+                return 201, {"friend": store.add_friend(user["id"], code)}, {}
+
+        elif path.startswith("/v1/friends/") and method == "DELETE":
+            user = current_user()
+            store.remove_friend(user["id"], path[len("/v1/friends/"):])
+            return 204, None, {}
+
+        elif path == "/v1/nudges":
+            user = current_user()
+            if method == "GET":
+                return 200, {"nudges": store.pending_nudges(user["id"])}, {}
+            if method == "POST":
+                to_id = body_json().get("to")
+                if not isinstance(to_id, str):
+                    raise ApiError(400, "'to' is required.")
+                store.send_nudge(user["id"], to_id)
+                return 201, {}, {}
+
+        elif path == "/v1/nudges/ack" and method == "POST":
+            user = current_user()
+            ids = body_json().get("ids")
+            if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+                raise ApiError(400, "'ids' must be a list of integers.")
+            store.ack_nudges(user["id"], ids[:200])
+            return 204, None, {}
+
+        raise ApiError(404, "Not found.")
+    except ApiError as error:
+        return error.status, {"error": error.message}, error.headers
+
+
+def encode(payload):
+    return b"" if payload is None else json.dumps(payload).encode("utf-8")
+
+
+def safe_handle(store, verbose, *args):
+    try:
+        return handle(store, *args)
+    except Exception:  # never leak internals to the client
+        if verbose:
+            traceback.print_exc()
+        return 500, {"error": "Server error."}, {}
+
+
+# -- standalone server (http.server) -----------------------------------------
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "GroundedServer/1"
     store = None  # set by make_server
@@ -273,132 +410,78 @@ class Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(fmt, *args)
 
-    # -- plumbing ---------------------------------------------------------
-
-    def _send(self, status, payload=None, headers=None):
-        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        for key, value in (headers or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _read_json(self):
+    def _dispatch(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            raise ApiError(400, "Bad Content-Length.")
-        if length > MAX_BODY_BYTES:
-            raise ApiError(413, "Request too large.")
-        if length == 0:
-            return {}
-        try:
-            data = json.loads(self.rfile.read(length))
-        except (ValueError, UnicodeDecodeError):
-            raise ApiError(400, "Body must be JSON.")
-        if not isinstance(data, dict):
-            raise ApiError(400, "Body must be a JSON object.")
-        return data
-
-    def _user(self):
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            raise ApiError(401, "Missing credentials.")
-        user = self.store.user_for_token(header[len("Bearer "):].strip())
-        if user is None:
-            raise ApiError(401, "Unknown or revoked credentials.")
-        return user
-
-    def _dispatch(self):
-        path = urlparse(self.path).path.rstrip("/") or "/"
-        method = self.command
-        try:
-            if path == "/health" and method == "GET":
-                return self._send(200, {"ok": True})
-
-            if path == "/v1/users" and method == "POST":
-                name = clean_name(self._read_json().get("name"))
-                return self._send(201, self.store.create_user(name))
-
-            if path == "/v1/me":
-                user = self._user()
-                if method == "GET":
-                    return self._send(200, {"id": user["id"], "name": user["name"], "code": user["code"]})
-                if method == "DELETE":
-                    self.store.delete_user(user["id"])
-                    return self._send(204)
-
-            elif path == "/v1/me/status" and method == "PUT":
-                user = self._user()
-                body = self._read_json()
-                state = body.get("state")
-                if state not in STATES:
-                    raise ApiError(400, "state must be 'grounded' or 'unlocked'.")
-                ends_at = body.get("unlockEndsAt")
-                if state == "unlocked":
-                    if (
-                        isinstance(ends_at, bool)
-                        or not isinstance(ends_at, (int, float))
-                        or not math.isfinite(ends_at)
-                    ):
-                        raise ApiError(400, "unlockEndsAt is required when unlocked.")
-                else:
-                    ends_at = None
-                self.store.set_status(user["id"], state, ends_at)
-                return self._send(204)
-
-            elif path == "/v1/friends":
-                user = self._user()
-                if method == "GET":
-                    return self._send(200, {"friends": self.store.friends_of(user["id"])})
-                if method == "POST":
-                    code = normalize_code(self._read_json().get("code"))
-                    return self._send(201, {"friend": self.store.add_friend(user["id"], code)})
-
-            elif path.startswith("/v1/friends/") and method == "DELETE":
-                user = self._user()
-                self.store.remove_friend(user["id"], path[len("/v1/friends/"):])
-                return self._send(204)
-
-            elif path == "/v1/nudges":
-                user = self._user()
-                if method == "GET":
-                    return self._send(200, {"nudges": self.store.pending_nudges(user["id"])})
-                if method == "POST":
-                    to_id = self._read_json().get("to")
-                    if not isinstance(to_id, str):
-                        raise ApiError(400, "'to' is required.")
-                    self.store.send_nudge(user["id"], to_id)
-                    return self._send(201, {})
-
-            elif path == "/v1/nudges/ack" and method == "POST":
-                user = self._user()
-                ids = self._read_json().get("ids")
-                if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
-                    raise ApiError(400, "'ids' must be a list of integers.")
-                self.store.ack_nudges(user["id"], ids[:200])
-                return self._send(204)
-
-            raise ApiError(404, "Not found.")
-        except ApiError as error:
-            self._send(error.status, {"error": error.message}, error.headers)
-        except Exception:  # never leak internals to the client
-            if getattr(self.server, "verbose", False):
-                traceback.print_exc()
-            self._send(500, {"error": "Server error."})
+            length = -1
+        if length < 0:
+            status, payload, headers = 400, {"error": "Bad Content-Length."}, {}
+        else:
+            status, payload, headers = safe_handle(
+                self.store, getattr(self.server, "verbose", False),
+                self.command, self.path, self.headers.get("Authorization"), length, self.rfile.read,
+            )
+        body = encode(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     do_GET = do_POST = do_PUT = do_DELETE = _dispatch
 
 
-def make_server(db_path, host="127.0.0.1", port=8787, clock=time.time, verbose=False):
-    handler = type("BoundHandler", (Handler,), {"store": Store(db_path, clock)})
+def make_server(db_path, host="127.0.0.1", port=8787, clock=time.time, verbose=False, **store_options):
+    handler = type("BoundHandler", (Handler,), {"store": Store(db_path, clock, **store_options)})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     server.verbose = verbose
     return server
+
+
+# -- WSGI (PythonAnywhere and friends) ---------------------------------------
+
+REASONS = {200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request", 401: "Unauthorized",
+           403: "Forbidden", 404: "Not Found", 409: "Conflict", 413: "Payload Too Large",
+           429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
+
+
+def make_wsgi_app(db_path=None, clock=time.time, verbose=False, **store_options):
+    """Builds a WSGI callable. The database is opened on the first request, so
+    importing this module never touches the disk."""
+    state = {}
+
+    def application(environ, start_response):
+        if "store" not in state:
+            path = db_path or os.environ.get("GROUNDED_DB") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "grounded.db")
+            state["store"] = Store(path, clock, **store_options)
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            length = -1
+        target = environ.get("PATH_INFO", "/")
+        if length < 0:
+            status, payload, headers = 400, {"error": "Bad Content-Length."}, {}
+        else:
+            status, payload, headers = safe_handle(
+                state["store"], verbose, environ.get("REQUEST_METHOD", "GET"), target,
+                environ.get("HTTP_AUTHORIZATION"), length, environ["wsgi.input"].read,
+            )
+        body = encode(payload)
+        response_headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        response_headers += list(headers.items())
+        start_response("%d %s" % (status, REASONS.get(status, "Error")), response_headers)
+        return [body]
+
+    return application
+
+
+# Entry point for WSGI hosts: `from server import application`
+application = make_wsgi_app()
 
 
 def main():
