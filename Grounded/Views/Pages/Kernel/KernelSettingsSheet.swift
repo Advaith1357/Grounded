@@ -13,13 +13,16 @@
 //
 
 import SwiftUI
-import FamilyControls
 
 struct KernelSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var shieldManager: ScreenTimeShieldManager
+    @EnvironmentObject private var friends: FriendsViewModel
 
-    @State private var showPicker = false
+    @AppStorage(SettingsKey.dailyLimitMinutes) private var dailyLimitMinutes = DailyLimit.defaultMinutes
+    @AppStorage(SettingsKey.onboardingCompleted) private var onboardingCompleted = true
+    @State private var isTestingConnection = false
+    @State private var connectionResult: (ok: Bool, message: String)?
     @AppStorage(SettingsKey.friendsServerURL) private var friendsServerURL = SettingsKey.defaultFriendsServerURL
 
     @State private var apiKeyInput = ""
@@ -33,11 +36,13 @@ struct KernelSettingsSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    Button("Choose Apps to Block") { showPicker = true }
+                    Stepper(value: $dailyLimitMinutes, in: DailyLimit.range, step: DailyLimit.step) {
+                        Text("Maximum daily load: \(DailyLimit.label(minutes: dailyLimitMinutes))")
+                    }
                 } header: {
-                    Text("Shielded Apps")
+                    Text("Daily Limit")
                 } footer: {
-                    Text(selectionSummary)
+                    Text("The most screen time you allow yourself in a day. It's the ceiling on the Queue's daily load (1V = 1 minute).")
                 }
 
                 Section {
@@ -63,10 +68,35 @@ struct KernelSettingsSheet: View {
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .onChange(of: friendsServerURL) { _, _ in connectionResult = nil }
+
+                    Button(isTestingConnection ? "Testing…" : "Test connection") {
+                        Task {
+                            isTestingConnection = true
+                            connectionResult = await friends.testConnection()
+                            isTestingConnection = false
+                        }
+                    }
+                    .disabled(isTestingConnection)
                 } header: {
                     Text("The Grid Server")
                 } footer: {
-                    Text("Where friends, statuses and nudges are stored. Run Server/server.py on your Mac, or point this at a deployed copy.")
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let result = connectionResult {
+                            Text(result.message)
+                                .foregroundStyle(result.ok ? NexusColor.accent : Color(hex: 0xEF4444))
+                        }
+                        Text("Where friends, statuses and nudges are stored: your hosted server, or Server/server.py running on your Mac.")
+                    }
+                }
+
+                Section {
+                    Button("Replay onboarding") {
+                        dismiss()
+                        // Let this sheet finish closing before the full-screen
+                        // onboarding is presented over the app.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { onboardingCompleted = false }
+                    }
                 }
 
                 Section {
@@ -98,17 +128,8 @@ struct KernelSettingsSheet: View {
             .alert("Key Saved", isPresented: $showSavedConfirmation) {
                 Button("OK", role: .cancel) { }
             }
-            .familyActivityPicker(isPresented: $showPicker, selection: $shieldManager.selection)
         }
         .preferredColorScheme(.dark)
-    }
-
-    private var selectionSummary: String {
-        let selection = shieldManager.selection
-        let count = selection.applicationTokens.count + selection.categoryTokens.count + selection.webDomainTokens.count
-        return count == 0
-            ? "Nothing selected — grounding won't block anything yet."
-            : "\(count) item\(count == 1 ? "" : "s") shielded while grounded."
     }
 
     private var lockout: NightlyLockout {
@@ -151,5 +172,6 @@ struct KernelSettingsSheet: View {
 #Preview {
     KernelSettingsSheet()
         .environmentObject(ScreenTimeShieldManager())
+        .environmentObject(FriendsViewModel.preview())
 }
 #endif

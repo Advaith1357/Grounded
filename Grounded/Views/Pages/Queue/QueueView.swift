@@ -7,6 +7,10 @@
 //  `taskQueue.first` (the Active slot) is interactive. Everything below it is
 //  Standby — muted and non-interactive until the Active task resolves.
 //
+//  Block lists (which apps get blocked) live at the top of this tab: they're
+//  the thing you set up while planning your work, so they sit next to the
+//  tasks instead of buried in Settings.
+//
 
 import SwiftUI
 
@@ -20,7 +24,8 @@ struct QueueView: View {
 
     @AppStorage(SettingsKey.nightlyLockoutTime) private var lockoutTimeInterval = SettingsKey.defaultLockoutInterval
 
-    private static let dailyLoadTarget = 120
+    /// The user's own maximum, chosen in onboarding (Settings can change it).
+    @AppStorage(SettingsKey.dailyLimitMinutes) private var dailyLimitMinutes = DailyLimit.defaultMinutes
 
     private var voltageEarnedToday: Int {
         let calendar = Calendar.current
@@ -40,18 +45,24 @@ struct QueueView: View {
             VStack(spacing: 0) {
                 stickyHeader
 
-                if viewModel.taskQueue.isEmpty {
-                    trickleBanner
-                }
+                trickleBanner
 
                 ZStack(alignment: .bottomTrailing) {
                     NexusColor.background.ignoresSafeArea()
                     CircuitBackdrop()
 
-                    if viewModel.taskQueue.isEmpty {
-                        emptyState
-                    } else {
-                        list
+                    ScrollView {
+                        VStack(spacing: 20) {
+                            BlockListsSection()
+
+                            if viewModel.taskQueue.isEmpty {
+                                emptyState
+                            } else {
+                                taskRows
+                            }
+                        }
+                        .padding(NexusMetrics.screenPadding)
+                        .padding(.bottom, 80) // room for the FAB
                     }
 
                     fab
@@ -95,7 +106,7 @@ struct QueueView: View {
 
     private var stickyHeader: some View {
         HStack {
-            Text("DAILY LOAD: \(voltageEarnedToday)V / \(Self.dailyLoadTarget)V")
+            Text("DAILY LOAD: \(voltageEarnedToday) / \(dailyLimitMinutes) MIN")
                 .font(NexusFont.mono(11))
                 .foregroundStyle(NexusColor.textSecondary)
             Spacer()
@@ -112,17 +123,51 @@ struct QueueView: View {
         }
     }
 
-    /// Only shown while the queue is empty — the trickle generator only runs then.
+    /// Always visible, so it's clear whether passive charge is running, why
+    /// not, and when the next +1V lands.
     private var trickleBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "bolt.fill")
-            Text("Trickle Charge Active: \(min(viewModel.economy.voltageBalance, 20))V / 20V Buffer")
-                .font(NexusFont.sans(13, weight: .semibold))
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let status = TrickleSchedule.status(
+                queueIsEmpty: viewModel.taskQueue.isEmpty,
+                balance: viewModel.economy.voltageBalance,
+                lastTrickleAt: viewModel.economy.lastTrickleAt,
+                now: timeline.date
+            )
+            let paused = status == .pausedWhileTaskQueued
+
+            VStack(spacing: 2) {
+                HStack(spacing: 8) {
+                    Image(systemName: paused ? "pause.fill" : "bolt.fill")
+                    Text(Self.trickleHeadline(status, balance: viewModel.economy.voltageBalance))
+                        .font(NexusFont.sans(13, weight: .semibold))
+                }
+                if let detail = Self.trickleDetail(status) {
+                    Text(detail)
+                        .font(NexusFont.mono(11))
+                        .opacity(0.8)
+                }
+            }
+            .foregroundStyle(paused ? NexusColor.textSecondary : NexusColor.background)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(paused ? NexusColor.surfaceElevated : NexusColor.accent)
         }
-        .foregroundStyle(NexusColor.background)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(NexusColor.accent)
+    }
+
+    private static func trickleHeadline(_ status: TrickleSchedule.Status, balance: Int) -> String {
+        switch status {
+        case .pausedWhileTaskQueued: return "Trickle charge paused"
+        case .full: return "Trickle Charge full: \(balance)V / \(TrickleSchedule.cap)V"
+        case .charging: return "Trickle Charge Active: \(balance)V / \(TrickleSchedule.cap)V"
+        }
+    }
+
+    private static func trickleDetail(_ status: TrickleSchedule.Status) -> String? {
+        switch status {
+        case .pausedWhileTaskQueued: return "Charges again once your queue is empty"
+        case .full: return nil
+        case .charging(let seconds): return "Next +1V in \(TrickleSchedule.countdownText(seconds))"
+        }
     }
 
     private var emptyState: some View {
@@ -139,22 +184,19 @@ struct QueueView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
     }
 
-    private var list: some View {
-        ScrollView {
-            VStack(spacing: 12) {
-                ForEach(Array(viewModel.taskQueue.enumerated()), id: \.element.id) { index, task in
-                    if index == 0 {
-                        activeCard(for: task)
-                    } else {
-                        standbyRow(for: task)
-                    }
+    private var taskRows: some View {
+        VStack(spacing: 12) {
+            ForEach(Array(viewModel.taskQueue.enumerated()), id: \.element.id) { index, task in
+                if index == 0 {
+                    activeCard(for: task)
+                } else {
+                    standbyRow(for: task)
                 }
             }
-            .padding(NexusMetrics.screenPadding)
-            .padding(.bottom, 80) // room for the FAB
         }
     }
 
@@ -269,22 +311,45 @@ struct QueueView: View {
     }
 }
 
+/// Reports the rendered height of the feedback text, so the expanded view can
+/// be exactly as tall as the text (up to a cap) instead of a fixed-size box.
+private struct FeedbackHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 private struct ResultBanner: View {
     let result: VerificationResult
     let onDismiss: () -> Void
 
+    @State private var isExpanded = false
+    @State private var feedbackHeight: CGFloat = 0
+
+    private static let collapsedLineLimit = 2
+    private static let maxExpandedHeight: CGFloat = 280
+
+    /// Roughly what two lines hold at this size; past it the text is cut off.
+    private var mayBeTruncated: Bool { result.feedback.count > 70 }
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: result.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
                 .foregroundStyle(result.passed ? NexusColor.accent : Color(hex: 0xEF4444))
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(result.passed ? "Verified — +\(VerificationResult.flatReward)V" : "Not verified")
                     .font(NexusFont.sans(14, weight: .bold))
                     .foregroundStyle(NexusColor.textPrimary)
-                Text(result.feedback)
-                    .font(NexusFont.sans(12))
-                    .foregroundStyle(NexusColor.textSecondary)
-                    .lineLimit(2)
+                feedback
+                if mayBeTruncated {
+                    Text(isExpanded ? "TAP TO SHOW LESS" : "TAP TO READ ALL")
+                        .font(NexusFont.mono(10, weight: .bold))
+                        .foregroundStyle(NexusColor.accent)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard mayBeTruncated else { return }
+                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
             }
             Spacer(minLength: 0)
             Button(action: onDismiss) {
@@ -298,10 +363,33 @@ private struct ResultBanner: View {
         .clipShape(RoundedRectangle(cornerRadius: NexusMetrics.cardRadius))
         .shadow(radius: 8)
     }
+
+    @ViewBuilder
+    private var feedback: some View {
+        let text = Text(result.feedback)
+            .font(NexusFont.sans(12))
+            .foregroundStyle(NexusColor.textSecondary)
+            .textSelection(.enabled)
+
+        if isExpanded {
+            ScrollView {
+                text
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: FeedbackHeightKey.self, value: proxy.size.height)
+                    })
+            }
+            .frame(height: min(max(feedbackHeight, 1), Self.maxExpandedHeight))
+            .onPreferenceChange(FeedbackHeightKey.self) { feedbackHeight = $0 }
+        } else {
+            text.lineLimit(Self.collapsedLineLimit)
+        }
+    }
 }
 
 #if DEBUG
 #Preview {
     QueueView(viewModel: .previewQueue())
+        .environmentObject(ScreenTimeShieldManager())
 }
 #endif
