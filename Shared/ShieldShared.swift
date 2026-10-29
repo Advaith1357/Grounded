@@ -3,8 +3,8 @@
 //  Shared by the app and the DeviceActivityMonitor extension.
 //
 //  The extension can't see the app's memory or sandbox, so everything it needs
-//  to re-apply the shield travels through the App Group: the picked apps
-//  (FamilyActivitySelection, encoded in the group's UserDefaults) and the
+//  to re-apply the shield travels through the App Group: the block lists
+//  (see BlockLists.swift, encoded in the group's UserDefaults) and the
 //  ManagedSettingsStore, which iOS shares between an app and its extensions.
 //
 
@@ -21,41 +21,48 @@ enum ShieldState: String {
 }
 
 enum AppGroup {
-    static let identifier = "group.com.grounded.app"
+    /// Derived from the app's bundle ID rather than hard-coded: App Group IDs
+    /// are unique across every developer on Apple's platform, so a generic one
+    /// would likely already be taken. The extensions' bundle IDs are the app's
+    /// plus a suffix, so they strip it and arrive at the same group.
+    static let identifier = identifier(
+        forBundleID: Bundle.main.bundleIdentifier,
+        isExtension: Bundle.main.bundlePath.hasSuffix(".appex")
+    )
 
-    /// Falls back to standard defaults if the group isn't provisioned yet
-    /// (simulator builds, or before the developer account is set up).
+    static func identifier(forBundleID bundleID: String?, isExtension: Bool) -> String {
+        guard var id = bundleID, !id.isEmpty else { return "group.com.grounded.app" }
+        if isExtension, let lastDot = id.lastIndex(of: ".") {
+            id = String(id[..<lastDot])
+        }
+        return "group.\(id)"
+    }
+
+    /// The group's defaults, or standard defaults when the group isn't
+    /// provisioned (free-account builds, before a developer account). Checking
+    /// for the container matters: a suite opened without the entitlement can
+    /// look fine but not persist.
     static var defaults: UserDefaults {
-        UserDefaults(suiteName: identifier) ?? .standard
-    }
-}
-
-enum SharedSelection {
-    private static let key = "settings.familyActivitySelection"
-
-    static func load() -> FamilyActivitySelection {
-        guard
-            let data = AppGroup.defaults.data(forKey: key),
-            let selection = try? JSONDecoder().decode(FamilyActivitySelection.self, from: data)
-        else { return FamilyActivitySelection() }
-        return selection
-    }
-
-    static func save(_ selection: FamilyActivitySelection) {
-        guard let data = try? JSONEncoder().encode(selection) else { return }
-        AppGroup.defaults.set(data, forKey: key)
+        if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier) != nil,
+           let suite = UserDefaults(suiteName: identifier) {
+            return suite
+        }
+        return .standard
     }
 }
 
 enum ShieldApplier {
 
-    static func apply(_ state: ShieldState, selection: FamilyActivitySelection, to store: ManagedSettingsStore = ManagedSettingsStore()) {
+    /// `.grounded` shields the union of the lists that are switched on;
+    /// `.unlocked` clears everything. With no list on, nothing is shielded.
+    static func apply(_ state: ShieldState, lists: [BlockList], to store: ManagedSettingsStore = ManagedSettingsStore()) {
         switch state {
         case .grounded:
-            store.shield.applications = selection.applicationTokens
+            let selection = BlockLists.combinedSelection(of: lists)
+            store.shield.applications = selection.applicationTokens.isEmpty ? nil : selection.applicationTokens
             // A picked category or website would otherwise silently not block.
-            store.shield.applicationCategories = .specific(selection.categoryTokens)
-            store.shield.webDomains = selection.webDomainTokens
+            store.shield.applicationCategories = selection.categoryTokens.isEmpty ? nil : .specific(selection.categoryTokens)
+            store.shield.webDomains = selection.webDomainTokens.isEmpty ? nil : selection.webDomainTokens
         case .unlocked:
             store.shield.applications = nil
             store.shield.applicationCategories = nil
@@ -63,9 +70,9 @@ enum ShieldApplier {
         }
     }
 
-    /// For the extension: re-ground using the selection saved by the app.
-    static func groundFromSavedSelection() {
-        apply(.grounded, selection: SharedSelection.load())
+    /// For the extension: re-ground using the lists the app saved.
+    static func groundFromSavedLists() {
+        apply(.grounded, lists: SharedBlockLists.load() ?? [])
     }
 }
 

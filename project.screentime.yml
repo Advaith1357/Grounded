@@ -1,0 +1,96 @@
+# SCREEN TIME BUILD: real app blocking. Needs a paid Apple Developer account,
+# because it requests Family Controls and App Groups on the app and on three
+# Screen Time extensions. (A free Apple ID can't sign it.)
+#
+#   xcodegen generate --spec project.screentime.yml   # this build
+#   xcodegen generate                                  # default: free-account build
+#
+# It's the default project plus: the SCREEN_TIME compile flag (turns blocking
+# on in the code), the capabilities, and the extensions that react to opened
+# apps, expired breaks and the nightly Circuit Breaker.
+
+include:
+  - path: project.yml
+
+targetTemplates:
+  # All three extensions need the same entitlements: Family Controls itself,
+  # plus the App Group they use to share the app's saved block lists. The group
+  # ID is built from the bundle ID so it's unique to you (see AppGroup).
+  ScreenTimeExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    entitlements:
+      path: Config/Extension.entitlements
+      properties:
+        com.apple.developer.family-controls: true
+        com.apple.security.application-groups: ["group.$(GROUNDED_BUNDLE_ID)"]
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SCREEN_TIME"
+
+targets:
+  Grounded:
+    settings:
+      base:
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SCREEN_TIME"
+    entitlements:
+      path: Config/Grounded.entitlements
+      properties:
+        com.apple.developer.family-controls: true
+        com.apple.security.application-groups: ["group.$(GROUNDED_BUNDLE_ID)"]
+    dependencies:
+      - target: ShieldConfiguration
+      - target: ShieldAction
+      - target: DeviceActivityMonitor
+
+  # Custom interceptor screen shown when a shielded app is opened.
+  ShieldConfiguration:
+    templates: [ScreenTimeExtension]
+    sources:
+      - path: ShieldConfiguration
+    info:
+      path: ShieldConfiguration/Info.plist
+      properties:
+        CFBundleDisplayName: ShieldConfiguration
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.ManagedSettingsUI.shield-configuration-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShieldConfigurationExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(GROUNDED_BUNDLE_ID).ShieldConfiguration
+
+  # Handles taps on the interceptor screen's button.
+  ShieldAction:
+    templates: [ScreenTimeExtension]
+    sources:
+      - path: ShieldAction
+    info:
+      path: ShieldAction/Info.plist
+      properties:
+        CFBundleDisplayName: ShieldAction
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.ManagedSettings.shield-action-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShieldActionExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(GROUNDED_BUNDLE_ID).ShieldAction
+
+  # Re-grounds when a break ends or the nightly Circuit Breaker opens, even if
+  # the app isn't running.
+  DeviceActivityMonitor:
+    templates: [ScreenTimeExtension]
+    sources:
+      - path: DeviceActivityMonitor
+      - path: Shared
+    info:
+      path: DeviceActivityMonitor/Info.plist
+      properties:
+        CFBundleDisplayName: DeviceActivityMonitor
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.deviceactivity.monitor-extension
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).DeviceActivityMonitorExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(GROUNDED_BUNDLE_ID).DeviceActivityMonitor

@@ -74,6 +74,8 @@ struct NightlyLockout: Equatable {
     /// The wake time as UI copy, e.g. "6:00 AM".
     func endTimeText(calendar: Calendar = .current) -> String {
         let date = calendar.date(from: endComponents) ?? Date()
-        return date.formatted(date: .omitted, time: .shortened)
+        // Format in the calendar's own zone, not whatever the device is in, so
+        // the text always matches the components it was built from.
+        return date.formatted(Date.FormatStyle(date: .omitted, time: .shortened, locale: .current, calendar: calendar, timeZone: calendar.timeZone))
     }
 }

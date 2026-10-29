@@ -33,7 +33,7 @@ final class ShieldActionExtension: ShieldActionDelegate {
 
         let content = UNMutableNotificationContent()
         content.title = "[ GROUNDED ]"
-        content.body = "Open Grounded and tap Discharge to spend Voltage."
+        content.body = "Tap to open Grounded and spend Voltage."
         content.sound = .default
         let request = UNNotificationRequest(identifier: "shield.discharge-reminder", content: content, trigger: nil)
 

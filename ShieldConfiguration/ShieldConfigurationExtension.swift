@@ -6,7 +6,9 @@
 //  match Grounded: #121212 background, Electric Yellow (#EAE04A) icon and
 //  primary button.
 //
-//  The primary button's behavior lives in the ShieldAction extension.
+//  The primary button's behavior lives in the ShieldAction extension. It can't
+//  open Grounded (iOS doesn't let a shield do that), so its label and the
+//  subtitle describe what really happens: a notification you tap.
 //
 //  ShieldConfiguration only accepts colors and plain text — there is no font
 //  control — so the monospaced "[ GROUNDED ]" header is rendered into the icon
@@ -44,8 +46,8 @@ final class ShieldConfigurationExtension: ShieldConfigurationDataSource {
             backgroundColor: background,
             icon: headerIcon(),
             title: .init(text: "[ DISCHARGE REQUIRED ]", color: yellow),
-            subtitle: .init(text: "Spend Voltage in Grounded to unlock.", color: UIColor(white: 0.62, alpha: 1)),
-            primaryButtonLabel: .init(text: "Go to Grounded", color: background),
+            subtitle: .init(text: "Spend Voltage in Grounded to unlock. Tap the button, then tap the notification to open it.", color: UIColor(white: 0.62, alpha: 1)),
+            primaryButtonLabel: .init(text: "Remind Me in Grounded", color: background),
             primaryButtonBackgroundColor: yellow,
             secondaryButtonLabel: nil
         )

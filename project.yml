@@ -7,7 +7,12 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
 
-# Personal settings (your Apple Developer team ID) live in
+# DEFAULT BUILD: runs on a real iPhone with a free Apple ID. It requests no
+# Family Controls, no App Groups, and embeds no Screen Time extensions, so app
+# blocking is paused. The Screen Time build (needs a paid developer account) is
+# project.screentime.yml:  xcodegen generate --spec project.screentime.yml
+#
+# Personal settings (your team ID, bundle ID, server host) live in
 # Config/Local.xcconfig, which is gitignored. See Config/Local.xcconfig.example.
 configFiles:
   Debug: Config/Base.xcconfig
@@ -19,23 +24,6 @@ settings:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
-
-targetTemplates:
-  # All three Screen Time extensions need the same entitlements: Family
-  # Controls itself, plus the App Group they use to share the app's saved
-  # app selection.
-  ScreenTimeExtension:
-    type: app-extension
-    platform: iOS
-    deploymentTarget: "17.0"
-    entitlements:
-      path: Config/Extension.entitlements
-      properties:
-        com.apple.developer.family-controls: true
-        com.apple.security.application-groups: [group.com.grounded.app]
-    settings:
-      base:
-        TARGETED_DEVICE_FAMILY: "1"
 
 targets:
   Grounded:
@@ -50,74 +38,15 @@ targets:
       - path: Shared
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.grounded.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(GROUNDED_BUNDLE_ID)
         INFOPLIST_FILE: Grounded/Support/Info.plist
         # 1 = iPhone only.
         TARGETED_DEVICE_FAMILY: "1"
         # SwiftUI App lifecycle, no storyboard.
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: "YES"
-    entitlements:
-      path: Config/Grounded.entitlements
-      properties:
-        com.apple.developer.family-controls: true
-        com.apple.security.application-groups: [group.com.grounded.app]
-    dependencies:
-      - target: ShieldConfiguration
-      - target: ShieldAction
-      - target: DeviceActivityMonitor
     scheme:
       testTargets:
         - GroundedTests
-
-  # Custom interceptor screen shown when a shielded app is opened.
-  ShieldConfiguration:
-    templates: [ScreenTimeExtension]
-    sources:
-      - path: ShieldConfiguration
-    info:
-      path: ShieldConfiguration/Info.plist
-      properties:
-        CFBundleDisplayName: ShieldConfiguration
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.ManagedSettingsUI.shield-configuration-service
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShieldConfigurationExtension
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.grounded.app.ShieldConfiguration
-
-  # Handles taps on the interceptor screen's button.
-  ShieldAction:
-    templates: [ScreenTimeExtension]
-    sources:
-      - path: ShieldAction
-    info:
-      path: ShieldAction/Info.plist
-      properties:
-        CFBundleDisplayName: ShieldAction
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.ManagedSettings.shield-action-service
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShieldActionExtension
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.grounded.app.ShieldAction
-
-  # Re-grounds when a break ends or the nightly Circuit Breaker opens, even if
-  # the app isn't running.
-  DeviceActivityMonitor:
-    templates: [ScreenTimeExtension]
-    sources:
-      - path: DeviceActivityMonitor
-      - path: Shared
-    info:
-      path: DeviceActivityMonitor/Info.plist
-      properties:
-        CFBundleDisplayName: DeviceActivityMonitor
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.deviceactivity.monitor-extension
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).DeviceActivityMonitorExtension
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.grounded.app.DeviceActivityMonitor
 
   # Logic-only tests for the pure schedule / lockout math (no Screen Time
   # frameworks), so they run on the simulator.
@@ -129,7 +58,13 @@ targets:
       - path: Tests
       - path: Grounded/Services/NightlyLockout.swift
       - path: Shared/ShieldSchedule.swift
+      - path: Shared/BlockLists.swift
+      - path: Shared/ShieldShared.swift
       - path: Grounded/Services/Friends
+      - path: Grounded/Services/BreakWarningPlan.swift
+      - path: Grounded/Services/TrickleSchedule.swift
+      - path: Grounded/Services/PhoneHabitStats.swift
+      - path: Grounded/Services/OnboardingFlow.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.grounded.app.tests
